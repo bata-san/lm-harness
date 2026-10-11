@@ -1,2 +1,379 @@
-//! STUB — to be implemented. Runtime detection, command construction, metrics parsing, setup jobs.
-#![allow(dead_code, unused_variables)]
+//! Runtime adapters: detection, command construction, health and metrics, setup jobs.
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use regex::Regex;
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::config::{scripts_dir, Settings};
+
+/// How long detected versions are reused (version probes spawn subprocesses and are slow).
+const STATUS_TTL: Duration = Duration::from_secs(30);
+
+// ------------------------------------------------------------------ binaries
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| is_executable(p))
+}
+
+fn is_executable(p: &Path) -> bool {
+    p.metadata().map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+pub fn llama_server_bin(s: &Settings) -> Option<PathBuf> {
+    let d = s.llama_cpp_dir();
+    [d.join("build/bin/llama-server"), d.join("bin/llama-server")].into_iter().find(|p| p.is_file()).or_else(|| which("llama-server"))
+}
+
+pub fn vllm_bin(s: &Settings) -> Option<PathBuf> {
+    let cand = s.vllm_venv().join("bin/vllm");
+    if cand.is_file() {
+        Some(cand)
+    } else {
+        which("vllm")
+    }
+}
+
+pub fn ollama_bin() -> Option<PathBuf> {
+    which("ollama")
+}
+
+// ------------------------------------------------------------------ versions
+/// Run a command and return stdout + stderr (trimmed); `None` on spawn failure or timeout.
+async fn run_capture(program: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args).stdin(std::process::Stdio::null()).kill_on_drop(true);
+    let out = tokio::time::timeout(timeout, cmd.output()).await.ok()?.ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    Some(text.trim().to_string())
+}
+
+static LLAMA_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"version:\s*(\S+(?:\s*\([0-9a-f]+\))?)").unwrap());
+static CUDA_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"CUDA|ggml_cuda").unwrap());
+
+pub fn parse_llama_version(out: &str) -> String {
+    let ver = LLAMA_VERSION_RE
+        .captures(out)
+        .map(|c| c[1].to_string())
+        .or_else(|| out.lines().last().map(str::to_string))
+        .unwrap_or_else(|| "?".into());
+    if CUDA_RE.is_match(out) {
+        format!("{ver} CUDA")
+    } else {
+        ver
+    }
+}
+
+async fn llama_version(bin: &Path) -> Option<String> {
+    let out = run_capture(bin, &["--version"], Duration::from_secs(10)).await?;
+    Some(parse_llama_version(&out))
+}
+
+async fn vllm_version(s: &Settings) -> Option<String> {
+    let py = s.vllm_venv().join("bin/python");
+    if !py.exists() {
+        return None;
+    }
+    let out = run_capture(&py, &["-c", "import importlib.metadata as m; print(m.version('vllm'))"], Duration::from_secs(20)).await?;
+    // A failing import prints a traceback; only accept something that looks like a version.
+    out.lines().last().filter(|l| l.chars().next().is_some_and(|c| c.is_ascii_digit())).map(str::to_string)
+}
+
+static HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
+
+/// Call the Ollama HTTP API; `None` if unreachable or the call failed.
+pub async fn ollama_api(s: &Settings, path: &str, method: reqwest::Method, body: Option<Value>, timeout: Duration) -> Option<Value> {
+    let url = format!("{}{}", s.ollama_url.trim_end_matches('/'), path);
+    let mut req = HTTP.request(method, url).timeout(timeout);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let resp = req.send().await.ok()?.error_for_status().ok()?;
+    let bytes = resp.bytes().await.ok()?;
+    if bytes.is_empty() {
+        Some(Value::Object(Default::default()))
+    } else {
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+// -------------------------------------------------------------------- status
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct RuntimeStatus {
+    pub id: &'static str,
+    pub installed: bool,
+    pub path: Option<String>,
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<bool>,
+    pub install_job: &'static str,
+    pub description: &'static str,
+}
+
+struct VersionCache {
+    at: Instant,
+    key: String,
+    llama: Option<String>,
+    vllm: Option<String>,
+}
+
+static CACHE: LazyLock<tokio::sync::Mutex<Option<VersionCache>>> = LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// Forget cached versions (call after an install job finished).
+pub async fn invalidate_cache() {
+    *CACHE.lock().await = None;
+}
+
+/// Status of every runtime. The slow subprocess version probes for llama.cpp and vLLM are
+/// cached for 30 s; Ollama's version / `running` flag is a quick HTTP call and stays live.
+pub async fn status(s: &Settings) -> Vec<RuntimeStatus> {
+    let llama = llama_server_bin(s);
+    let vllm = vllm_bin(s);
+    let ollama = ollama_bin();
+
+    let key = format!("{}|{}", llama.as_deref().map_or(String::new(), |p| p.display().to_string()), vllm.as_deref().map_or(String::new(), |p| p.display().to_string()));
+    let (llama_ver, vllm_ver) = {
+        let mut cache = CACHE.lock().await;
+        match cache.as_ref().filter(|c| c.key == key && c.at.elapsed() < STATUS_TTL) {
+            Some(c) => (c.llama.clone(), c.vllm.clone()),
+            None => {
+                let (l, v) = tokio::join!(
+                    async {
+                        match &llama {
+                            Some(b) => llama_version(b).await,
+                            None => None,
+                        }
+                    },
+                    async {
+                        if vllm.is_some() {
+                            vllm_version(s).await
+                        } else {
+                            None
+                        }
+                    }
+                );
+                *cache = Some(VersionCache { at: Instant::now(), key, llama: l.clone(), vllm: v.clone() });
+                (l, v)
+            }
+        }
+    };
+    let ollama_ver = ollama_api(s, "/api/version", reqwest::Method::GET, None, Duration::from_secs(3)).await;
+
+    vec![
+        RuntimeStatus {
+            id: "llama.cpp",
+            installed: llama.is_some(),
+            path: llama.map(|p| p.display().to_string()),
+            version: llama_ver,
+            running: None,
+            install_job: "build-llama-cpp",
+            description: "GGUF 推論の本命。CUDA (sm_86) ネイティブビルドで最速。",
+        },
+        RuntimeStatus {
+            id: "vllm",
+            installed: vllm.is_some(),
+            path: vllm.map(|p| p.display().to_string()),
+            version: vllm_ver,
+            running: None,
+            install_job: "install-vllm",
+            description: "safetensors / AWQ / GPTQ 向けの高スループットサーバ。並列リクエストに強い。",
+        },
+        RuntimeStatus {
+            id: "ollama",
+            installed: ollama.is_some(),
+            path: ollama.map(|p| p.display().to_string()),
+            version: ollama_ver.as_ref().and_then(|v| v.get("version")).and_then(Value::as_str).map(str::to_string),
+            running: Some(ollama_ver.is_some()),
+            install_job: "install-ollama",
+            description: "手軽さ重視。モデル管理込み。中身は llama.cpp ベース。",
+        },
+    ]
+}
+
+// ------------------------------------------------------------------- command
+/// `(argv, env)` for starting a server. `env` holds only the additions to the inherited environment.
+pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, args: &[String], s: &Settings) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>)> {
+    let mut env: BTreeMap<String, String> = s.extra_env.clone();
+    let exe = |p: PathBuf| p.display().to_string();
+    match runtime {
+        "llama.cpp" => {
+            let Some(bin) = llama_server_bin(s) else {
+                anyhow::bail!("llama-server が見つかりません。Runtimes から llama.cpp をビルドしてください");
+            };
+            let mut cmd = vec![exe(bin), "-m".into(), model_path.to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
+            cmd.extend(args.iter().cloned());
+            Ok((cmd, env))
+        }
+        "vllm" => {
+            let Some(bin) = vllm_bin(s) else {
+                anyhow::bail!("vLLM が見つかりません。Runtimes からインストールしてください");
+            };
+            env.entry("VLLM_USE_V1".into()).or_insert_with(|| "1".into());
+            let mut cmd = vec![exe(bin), "serve".into(), model_path.to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
+            cmd.extend(args.iter().cloned());
+            Ok((cmd, env))
+        }
+        "ollama" => {
+            let Some(bin) = ollama_bin() else {
+                anyhow::bail!("ollama が見つかりません");
+            };
+            for (k, v) in [
+                ("OLLAMA_HOST", format!("{host}:{port}")),
+                ("OLLAMA_FLASH_ATTENTION", "1".into()),
+                ("OLLAMA_KV_CACHE_TYPE", "q8_0".into()),
+                ("OLLAMA_NUM_PARALLEL", "2".into()),
+                ("OLLAMA_KEEP_ALIVE", "30m".into()),
+            ] {
+                env.insert(k.into(), v);
+            }
+            let mut cmd = vec![exe(bin), "serve".into()];
+            cmd.extend(args.iter().cloned());
+            Ok((cmd, env))
+        }
+        other => anyhow::bail!("unknown runtime {other}"),
+    }
+}
+
+pub fn health_path(runtime: &str) -> &'static str {
+    match runtime {
+        "ollama" => "/",
+        _ => "/health",
+    }
+}
+
+// ------------------------------------------------------------------- metrics
+static METRIC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([a-zA-Z_:]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+|NaN)$").unwrap());
+
+fn metric_key(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "llamacpp:prompt_tokens_seconds" => "prompt_tps",
+        "llamacpp:predicted_tokens_seconds" => "gen_tps",
+        "llamacpp:requests_processing" | "vllm:num_requests_running" => "processing",
+        "llamacpp:requests_deferred" | "vllm:num_requests_waiting" => "deferred",
+        "llamacpp:tokens_predicted_total" | "vllm:generation_tokens_total" => "tokens_total",
+        "llamacpp:kv_cache_usage_ratio" | "vllm:gpu_cache_usage_perc" | "vllm:kv_cache_usage_perc" => "kv_usage",
+        _ => return None,
+    })
+}
+
+/// Parse Prometheus text, keeping the metrics the UI shows; labelled series are summed.
+pub fn parse_metrics(text: &str) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for line in text.lines() {
+        let Some(c) = METRIC_RE.captures(line) else { continue };
+        let Some(key) = metric_key(&c[1]) else { continue };
+        if let Ok(v) = c[2].parse::<f64>() {
+            if v.is_finite() {
+                *out.entry(key.to_string()).or_insert(0.0) += v;
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------- jobs
+pub struct JobDef {
+    pub id: &'static str,
+    pub title: &'static str,
+    /// Relative to `scripts/`.
+    pub script: &'static str,
+    pub sudo: bool,
+}
+
+pub const JOBS: [JobDef; 4] = [
+    JobDef { id: "setup", title: "WSL 基本セットアップ (apt / CUDA Toolkit / uv)", script: "wsl/setup.sh", sudo: true },
+    JobDef { id: "build-llama-cpp", title: "llama.cpp を CUDA でビルド / 更新", script: "wsl/build-llama-cpp.sh", sudo: false },
+    JobDef { id: "install-vllm", title: "vLLM を専用 venv にインストール / 更新", script: "wsl/install-vllm.sh", sudo: false },
+    JobDef { id: "install-ollama", title: "Ollama をインストール / 更新", script: "wsl/install-ollama.sh", sudo: true },
+];
+
+pub fn job(id: &str) -> Option<&'static JobDef> {
+    JOBS.iter().find(|j| j.id == id)
+}
+
+/// `(argv, env additions)` running a setup script.
+pub fn job_command(job_id: &str, s: &Settings) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>)> {
+    let Some(j) = job(job_id) else { anyhow::bail!("unknown job") };
+    let env = BTreeMap::from([
+        ("LLAMA_CPP_DIR".to_string(), s.llama_cpp_dir().display().to_string()),
+        ("VLLM_VENV".to_string(), s.vllm_venv().display().to_string()),
+        ("PATH".to_string(), format!("{}:/usr/local/cuda/bin", std::env::var("PATH").unwrap_or_default())),
+    ]);
+    Ok((vec!["bash".into(), scripts_dir().join(j.script).display().to_string()], env))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_sum_labelled_series() {
+        let text = "\
+# HELP llamacpp:prompt_tokens_seconds x
+# TYPE llamacpp:prompt_tokens_seconds gauge
+llamacpp:prompt_tokens_seconds 123.5
+llamacpp:predicted_tokens_seconds 45.25
+llamacpp:requests_processing 1
+llamacpp:kv_cache_usage_ratio 0.25
+vllm:num_requests_running{model_name=\"a\",engine=\"0\"} 2
+vllm:num_requests_running{model_name=\"b\",engine=\"1\"} 3
+vllm:generation_tokens_total{model_name=\"a\"} 1.5e3
+vllm:kv_cache_usage_perc{engine=\"0\"} 0.5
+vllm:gpu_cache_usage_perc{engine=\"0\"} NaN
+unrelated_metric 99
+";
+        let m = parse_metrics(text);
+        assert_eq!(m["prompt_tps"], 123.5);
+        assert_eq!(m["gen_tps"], 45.25);
+        assert_eq!(m["processing"], 1.0 + 5.0);
+        assert_eq!(m["tokens_total"], 1500.0);
+        assert_eq!(m["kv_usage"], 0.75);
+        assert!(!m.contains_key("deferred"));
+        assert!(!m.contains_key("unrelated_metric"));
+    }
+
+    #[test]
+    fn llama_version_parse() {
+        assert_eq!(parse_llama_version("version: 4567 (abc123f)\nbuilt with gcc"), "4567 (abc123f)");
+        assert_eq!(parse_llama_version("ggml_cuda_init: found 1 CUDA devices\nversion: 1 (deadbee)"), "1 (deadbee) CUDA");
+        assert_eq!(parse_llama_version(""), "?");
+    }
+
+    #[test]
+    fn health_paths() {
+        assert_eq!(health_path("llama.cpp"), "/health");
+        assert_eq!(health_path("vllm"), "/health");
+        assert_eq!(health_path("ollama"), "/");
+    }
+
+    #[test]
+    fn jobs_table() {
+        assert_eq!(JOBS.iter().filter(|j| j.sudo).map(|j| j.id).collect::<Vec<_>>(), vec!["setup", "install-ollama"]);
+        let (cmd, env) = job_command("build-llama-cpp", &Settings::default()).unwrap();
+        assert_eq!(cmd[0], "bash");
+        assert!(cmd[1].ends_with("scripts/wsl/build-llama-cpp.sh"));
+        assert!(env["PATH"].ends_with(":/usr/local/cuda/bin"));
+        assert!(job_command("nope", &Settings::default()).is_err());
+    }
+
+    #[test]
+    fn command_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("build/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("llama-server"), "#!/bin/sh\n").unwrap();
+        let mut s = Settings { llama_cpp_dir: dir.path().display().to_string(), vllm_venv: dir.path().join("nov").display().to_string(), ..Default::default() };
+        s.extra_env.insert("X".into(), "1".into());
+        let (cmd, env) = build_command("llama.cpp", "/m/a.gguf", "127.0.0.1", 8080, &["-c".into(), "4096".into()], &s).unwrap();
+        assert!(cmd[0].ends_with("build/bin/llama-server"));
+        assert_eq!(cmd[1..], ["-m", "/m/a.gguf", "--host", "127.0.0.1", "--port", "8080", "-c", "4096"]);
+        assert_eq!(env["X"], "1");
+        assert!(build_command("bogus", "", "h", 1, &[], &s).is_err());
+    }
+}
