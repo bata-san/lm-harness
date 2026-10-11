@@ -10,6 +10,8 @@
   - %UserProfile%\.wslconfig を生成 (メモリ/CPU を WSL に最大限割り当て、mirrored ネットワーク)
   - mirrored モードで Windows/LAN からハーネスに届くよう Hyper-V ファイアウォールを許可
   - (任意) Defender のリアルタイムスキャンから WSL の VHDX を除外
+  - FULL / SHARED モード切替の橋渡し: C:\ProgramData\llm-harness に apply-mode.ps1 を配置し、
+    スケジュール タスク \LLMHarness\ApplyMode を登録 (GPU 電力制限と vmmem 優先度を WSL から切替可能にする)
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File scripts\windows\setup-host.ps1
@@ -92,6 +94,52 @@ if ($DefenderExclusion) {
         Write-Host "   excluded $($_.FullName)\LocalState"
     }
     Add-MpPreference -ExclusionProcess "vmmem", "vmmemWSL", "wslhost.exe"
+}
+
+Step "FULL / SHARED モード切替の橋渡しを登録 (GPU 電力制限 + vmmem 優先度)"
+# GPU の電力制限 (nvidia-smi -pl) は管理者権限が必要だが、WSL 内の LLM Harness は非管理者で動く。
+# そこで「固定のスクリプトだけを最高権限で実行するスケジュール タスク」を登録し、
+# Harness は mode.json に希望状態を書いて schtasks.exe /Run でそのタスクを起動するだけにする。
+#   - タスクが実行するのは C:\ProgramData\llm-harness\apply-mode.ps1 だけ (任意コマンドは実行できない)
+#   - apply-mode.ps1 は mode.json から数値/列挙値だけを読み、厳密に検証する
+#     (電力制限は 50..1000 の整数、優先度は許可リスト) ので、JSON を改ざんしてもコマンド注入できない
+#   - フォルダ/スクリプトは管理者のみ書き込み可。一般ユーザーが書けるのは mode.json だけ
+#     (スクリプト自体を書き換えられると権限昇格になるため)
+$bridgeDir  = Join-Path $env:ProgramData "llm-harness"
+$bridgeUser = "$env:USERDOMAIN\$env:USERNAME"
+try {
+    New-Item -ItemType Directory -Path $bridgeDir -Force | Out-Null
+    # 継承を切り、SYSTEM / Administrators = フルコントロール、現在のユーザー = 読み取りのみ
+    # (ローカライズ名を避けるため SID を使う: S-1-5-18 = SYSTEM, S-1-5-32-544 = Administrators)
+    icacls $bridgeDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "${bridgeUser}:(OI)(CI)RX" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls (フォルダ ACL) が失敗しました" }
+
+    $applySrc = Join-Path $PSScriptRoot "apply-mode.ps1"
+    if (-not (Test-Path -LiteralPath $applySrc)) { throw "apply-mode.ps1 が $PSScriptRoot にありません" }
+    Copy-Item -LiteralPath $applySrc -Destination (Join-Path $bridgeDir "apply-mode.ps1") -Force
+
+    # mode.json: Harness (現在のユーザー) が更新できる唯一のファイル。初期値は FULL / 変更なし。
+    $modeFile = Join-Path $bridgeDir "mode.json"
+    if (-not (Test-Path -LiteralPath $modeFile)) {
+        $initial = '{"mode":"full","gpus":[],"vmmem_priority":"Normal","request_id":"","requested_at":""}'
+        [IO.File]::WriteAllText($modeFile, $initial, (New-Object Text.UTF8Encoding $false))
+    }
+    icacls "$bridgeDir\*" /reset | Out-Null
+    icacls $modeFile /grant "${bridgeUser}:M" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "icacls (mode.json の Modify 付与) が失敗しました" }
+
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$bridgeDir\apply-mode.ps1`""
+    $principal = New-ScheduledTaskPrincipal -UserId $bridgeUser -LogonType Interactive -RunLevel Highest
+    $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances Queue
+    Register-ScheduledTask -TaskPath "\LLMHarness\" -TaskName "ApplyMode" -Action $action -Principal $principal `
+        -Settings $taskSettings -Force `
+        -Description "LLM Harness: mode.json の内容 (GPU 電力制限 / vmmem 優先度) を反映する。固定スクリプトのみ実行。" | Out-Null
+    Write-Host "   タスク \LLMHarness\ApplyMode を登録しました (ユーザー: $bridgeUser, 設定先: $bridgeDir)"
+    Write-Host "   ※ GPU 電力制限の変更には、このユーザーが Administrators グループのメンバーである必要があります"
+} catch {
+    Write-Warning "モード切替の橋渡し登録をスキップ: $_"
 }
 
 if (-not $NoShutdown) {
