@@ -1,5 +1,6 @@
 mod affinity;
 mod auth;
+mod catalog;
 mod config;
 mod downloads;
 mod error;
@@ -10,6 +11,7 @@ mod mode;
 mod models;
 mod power;
 mod procs;
+mod proxy;
 mod runtimes;
 mod state;
 mod system;
@@ -119,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(state.instances.clone().monitor(state.clone()));
     tokio::spawn(state.power.clone().run(state.clone()));
     tokio::spawn(state.tunnel.clone().run(state.clone()));
+    tokio::spawn(catalog::run(state.clone()));
     state.instances.autostart(&state).await;
 
     let api = Router::new()
@@ -130,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(instances::router())
         .merge(power::router())
         .merge(tunnel::router())
+        .merge(catalog::router())
+        .merge(proxy::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
