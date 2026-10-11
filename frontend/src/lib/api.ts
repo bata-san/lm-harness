@@ -66,6 +66,7 @@ export type Gpu = {
   temperature: number
   power_draw: number | null
   power_limit: number | null
+  power_default_limit?: number | null
   clock_sm: number
   clock_sm_max: number
   pcie_gen: string
@@ -153,6 +154,9 @@ export type Instance = {
   args: string[]
   ready: boolean
   metrics: Metrics
+  auto_tune?: boolean
+  mode?: ModeName
+  stale?: boolean
 }
 
 export type Runtime = {
@@ -178,12 +182,13 @@ export type Profile = {
   args: string[]
   env: Record<string, string>
   autostart: boolean
+  auto_tune?: boolean
 }
 
 export type TuneResult = {
   args: string[]
   notes: string[]
-  estimate: { model_bytes?: number; kv_bytes?: number; vram_free?: number; vram_total?: number; fits?: boolean; ctx?: number; native_ctx?: number }
+  estimate: { model_bytes?: number; kv_bytes?: number; vram_free?: number; vram_total?: number; vram_reserve?: number; fits?: boolean; ctx?: number; native_ctx?: number }
 }
 
 export type Settings = {
@@ -201,3 +206,51 @@ export type Settings = {
 }
 
 export type LogTail = { lines: { seq: number; text: string }[]; last: number }
+
+export type ModeName = "full" | "shared"
+
+export type ModeProfile = {
+  mode: ModeName
+  cpu_set: number[]
+  physical_cores: number
+  logical_cpus: number
+  vram_reserve_mb: number
+  gpu_power_percent: number
+  ubatch_cap: number
+  nice: number
+  max_concurrent_downloads: number
+  connections_per_file: number
+  download_bytes_per_sec: number | null
+  vmmem_priority: string
+}
+
+export type SharedLimits = {
+  cpu_fraction: number
+  vram_reserve_mb: number
+  gpu_power_percent: number
+  ubatch_cap: number
+  nice: number
+  max_concurrent_downloads: number
+  connections_per_file: number
+  download_mib_per_sec: number | null
+  vmmem_below_normal: boolean
+}
+
+export type Schedule = { enabled: boolean; full_start: string; full_end: string; weekends_full: boolean }
+
+export type ModeSettings = { current: ModeName; auto_restart: boolean; shared: SharedLimits; schedule: Schedule }
+
+export type ModeSource = "manual" | "schedule" | "startup" | "settings"
+
+export type ModeState = {
+  mode: ModeName
+  source: ModeSource
+  switched_at: number | null
+  profile: ModeProfile
+  settings: ModeSettings
+  scheduled_mode: ModeName | null
+  next_switch_at?: number | null
+  bridge: { available: boolean; message: string; last_result: unknown | null }
+  restarted: string[]
+  topology: { physical_cores: number; logical_cores: number }
+}

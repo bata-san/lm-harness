@@ -12,6 +12,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { api, usePoll, type Instance, type Profile } from "@/lib/api"
 import { since } from "@/lib/format"
+import { MODE_LABEL, MODE_STYLE } from "@/lib/mode"
+import { cn } from "@/lib/utils"
 
 export function ServersPage() {
   const { data: instances, refetch } = usePoll<Instance[]>("/instances", 1500)
@@ -72,6 +74,17 @@ export function ServersPage() {
                   <span className="font-medium">{i.name}</span>
                   <Badge variant="outline">{i.runtime}</Badge>
                   <StatusBadge status={i.status} />
+                  {i.mode && (
+                    <Badge variant="outline" className={cn(MODE_STYLE[i.mode].text, MODE_STYLE[i.mode].border)} title="起動時のモード">
+                      {MODE_LABEL[i.mode]}で起動
+                    </Badge>
+                  )}
+                  {i.auto_tune && <Badge variant="secondary">自動チューニング</Badge>}
+                  {alive && i.stale && (
+                    <Badge className="bg-amber-500/15 text-amber-700 dark:text-amber-400" title="現在のモードと異なる設定で稼働中です">
+                      モード不一致 — 再起動で反映
+                    </Badge>
+                  )}
                   <span className="text-xs text-muted-foreground">
                     pid {i.pid ?? "—"} · {since(i.started_at)}
                     {i.returncode != null && ` · exit ${i.returncode}`}
@@ -94,7 +107,7 @@ export function ServersPage() {
                           variant="ghost"
                           title="同じ設定で再起動"
                           onClick={() =>
-                            setLaunch({ runtime: i.runtime, model: i.model, name: i.name, port: i.port, args: i.args })
+                            setLaunch({ runtime: i.runtime, model: i.model, name: i.name, port: i.port, args: i.args, auto_tune: i.auto_tune })
                           }
                         >
                           <PlayIcon />
@@ -136,6 +149,7 @@ export function ServersPage() {
               <span className="font-medium">{p.name}</span>
               <Badge variant="outline">{p.runtime}</Badge>
               {p.autostart && <Badge variant="secondary">自動起動</Badge>}
+              {p.auto_tune !== false && p.runtime !== "ollama" && <Badge variant="outline">自動チューニング</Badge>}
               <span className="truncate font-mono text-xs text-muted-foreground">{p.model}</span>
               <div className="ml-auto flex gap-1">
                 <Button size="sm" variant="ghost" onClick={() => setLaunch(p)}>

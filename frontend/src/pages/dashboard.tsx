@@ -1,5 +1,6 @@
 import { AlertTriangleIcon, CheckCircle2Icon, CpuIcon, HardDriveIcon, InfoIcon, MemoryStickIcon, XCircleIcon, ZapIcon } from "lucide-react"
 
+import { MODE_ICON } from "@/components/mode-switch"
 import { KV, Meter } from "@/components/stat"
 import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
@@ -7,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Skeleton } from "@/components/ui/skeleton"
 import { usePoll, type Check, type Download, type Instance, type SystemSnapshot } from "@/lib/api"
 import { bytes, duration, pct } from "@/lib/format"
+import { MODE_LABEL, MODE_STYLE, SOURCE_LABEL, gb, useMode } from "@/lib/mode"
 import { cn } from "@/lib/utils"
 
 export function DashboardPage() {
@@ -15,11 +17,34 @@ export function DashboardPage() {
   const { data: inst } = usePoll<Instance[]>("/instances", 2000)
   const { data: dls } = usePoll<Download[]>("/downloads", 2000)
 
+  const { state: mode } = useMode()
   const running = (inst ?? []).filter((i) => i.status === "running" || i.status === "starting")
   const active = (dls ?? []).filter((d) => d.status === "downloading" || d.status === "verifying" || d.status === "queued")
 
   return (
     <div className="grid gap-4">
+      {mode && (
+        <a
+          href="#mode"
+          className={cn("flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl border p-3 transition-colors hover:brightness-95", MODE_STYLE[mode.mode].border, MODE_STYLE[mode.mode].bg)}
+        >
+          <div className="flex items-center gap-2">
+            {mode.mode === "full" ? <MODE_ICON.full className={cn("size-5", MODE_STYLE.full.text)} /> : <MODE_ICON.shared className={cn("size-5", MODE_STYLE.shared.text)} />}
+            <div className="leading-tight">
+              <div className={cn("font-medium", MODE_STYLE[mode.mode].text)}>{MODE_LABEL[mode.mode]}</div>
+              <div className="text-[11px] text-muted-foreground">{SOURCE_LABEL[mode.source] ?? mode.source}</div>
+            </div>
+          </div>
+          <KV k="CPU" v={`${mode.profile.physical_cores} / ${mode.topology.physical_cores} コア`} />
+          <KV k="VRAM 予約" v={`${gb(mode.profile.vram_reserve_mb)} GB`} />
+          <KV k="GPU 電力" v={`${mode.profile.gpu_power_percent}%`} />
+          <KV k="micro-batch 上限" v={mode.profile.ubatch_cap} />
+          {(inst ?? []).some((i) => i.stale && (i.status === "running" || i.status === "starting")) && (
+            <Badge className="bg-amber-500/15 text-amber-700 dark:text-amber-400">モード不一致のサーバあり</Badge>
+          )}
+          <span className="ml-auto text-xs text-muted-foreground">詳細・設定 →</span>
+        </a>
+      )}
       <div className="grid gap-4 lg:grid-cols-2">
         {sys ? (
           sys.gpus.length ? (
