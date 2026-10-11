@@ -4,7 +4,9 @@
 Windows + **WSL2** 上で NVIDIA GPU と多コア CPU を使い切ることを目標にしています
 (想定環境: Lenovo ThinkStation P620 / Threadripper PRO 5000WX / RTX A5000)。
 
-UI は React + [shadcn/ui](https://ui.shadcn.com)、API は FastAPI。
+バックエンドは **Rust** (axum / tokio、`opt-level=3` + fat LTO、単一バイナリにフロントを埋め込み)、UI は React + [shadcn/ui](https://ui.shadcn.com)。
+
+![CI](../../actions/workflows/ci.yml/badge.svg)
 
 ![dashboard](docs/dashboard.png)
 
@@ -25,23 +27,70 @@ UI は React + [shadcn/ui](https://ui.shadcn.com)、API は FastAPI。
 | **ランタイム管理** | 各ランタイムの導入状況とバージョンを表示し、llama.cpp の CUDA ビルドや vLLM の導入/更新を UI から実行 |
 | **テレメトリ** | GPU (VRAM / 使用率 / 温度 / 電力 / クロック / PCIe リンク)、CPU コア別使用率、WSL メモリ、ディスク |
 | **環境チェック** | WSL で性能を落としがちな設定 (モデルが `/mnt/c` 上にある、nvcc 無し、メモリ割り当て不足、Linux 用 libcuda 混入など) を警告 |
+| **FULL / SHARED モード** | ヘッダーのスイッチ 1 つで切替。**FULL**: 全コア・全 VRAM・GPU 電力 100% で最大性能。**SHARED**: CPU の半分 (物理コア単位) を残し、VRAM を予約、GPU 電力を制限、`nice` を下げ、DL 帯域も制限してワークステーションを普通に使えるようにする。稼働中サーバの CPU affinity / 優先度は即時反映し、引数 (`-t` / `-ngl` / `-ub`) はモードに合わせて再計算 (再起動で反映)。時間帯スケジュールも可 |
+| **リモートアクセス** | Cloudflare Tunnel (quick / token) または ngrok でポート開放なしに公開。外部端末からはログイン (パスワード + 任意の TOTP) 後にコントロールパネルを操作。認証未設定ではトンネルを起動しない |
+| **モデルカタログ** | Hugging Face の trending / 新着 / DL 数順から、VRAM / RAM に収まるかを判定 (GPU / MoE オフロード / 一部オフロード / CPU / 大きすぎ) してワンクリックでインストール・アンインストール |
+| **OpenAI 互換プロキシ** | `/v1/*` を稼働中のサーバへ転送 (SSE ストリーミング対応)。API キー (`lh_...`) で外部アプリから利用可 |
 
 ## アーキテクチャ
 
 ```
- Windows                                   WSL2 (Ubuntu)
-┌──────────────────────┐   mirrored    ┌──────────────────────────────────────────┐
-│ ブラウザ              │  networking   │ LLM Harness (FastAPI :8787)               │
-│  http://localhost:8787├──────────────►│  ├─ DownloadManager ──► HF CDN / Ollama   │
-│                      │               │  ├─ InstanceManager ─┬► llama-server :8080│
-│ Windows のアプリ      │               │  │                   ├► vllm serve   :8081│
-│  (OpenAI 互換 API)    ├──────────────►│  │                   └► ollama serve      │
-│                      │               │  ├─ Telemetry (nvidia-smi, psutil)        │
-│ NVIDIA ドライバ ──────┼── /dev/dxg ──►│  └─ ~/models (ext4)                       │
-└──────────────────────┘               └──────────────────────────────────────────┘
+ 外部端末 ──HTTPS──► Cloudflare / ngrok ──┐ (アウトバウンド接続のみ、ポート開放なし)
+ Windows                                   │        WSL2 (Ubuntu)
+┌──────────────────────┐   mirrored    ┌───▼──────────────────────────────────────┐
+│ ブラウザ              │  networking   │ llm-harness (Rust/axum 127.0.0.1:8787)    │
+│  http://localhost:8787├──────────────►│  ├─ auth (argon2id / session / API key / TOTP)
+│                      │               │  ├─ DownloadManager ─► HF CDN (Range 並列)│
+│ ApplyMode タスク ◄────┼─ mode.json ───┤  ├─ InstanceManager ─┬► llama-server      │
+│  (GPU 電力 / vmmem)   │               │  │                   ├► vllm serve        │
+│ NVIDIA ドライバ ──────┼── /dev/dxg ──►│  │                   └► ollama serve      │
+└──────────────────────┘               │  ├─ PowerManager (FULL/SHARED, affinity)  │
+                                        │  ├─ Tunnel supervisor / Catalog / /v1 proxy
+                                        │  └─ ~/models (ext4)                       │
+                                        └──────────────────────────────────────────┘
 ```
 
-状態は `~/.llm-harness/` (`settings.json`, `downloads.json`, `profiles.json`) に保存されます。
+状態は `~/.llm-harness/` (`settings.json`, `downloads.json`, `profiles.json`, `auth.json`, ...) に保存されます。
+
+- **vLLM**: 既定で `--gpu-memory-utilization 0.92 --max-model-len 32768 --enable-prefix-caching`。
+- **Ollama**: `OLLAMA_FLASH_ATTENTION=1`、`OLLAMA_KV_CACHE_TYPE=q8_0`、`OLLAMA_HOST=127.0.0.1:11434` を systemd に設定済み。
+
+## モード切替 (FULL / SHARED)
+
+| | FULL | SHARED (既定値、設定画面で変更可) |
+| --- | --- | --- |
+| CPU | 全物理コア | 50% (上位番号のコアを使用、ワークステーション側に下位コアを残す) |
+| VRAM | 空き全部 | 4 GB 予約 |
+| GPU 電力 | 100% | 70% (Windows 側 `ApplyMode` タスク経由で `nvidia-smi -pl`) |
+| micro-batch | 自動 | 上限 256 |
+| `nice` | 0 | 10 |
+| ダウンロード | 全帯域・並列 | 1 並列・40 MiB/s |
+| vmmem 優先度 | Normal | BelowNormal |
+
+GPU 電力と vmmem 優先度は管理者権限が必要なため、`scripts/windows/setup-host.ps1` が固定スクリプトだけを実行するスケジュールタスク
+`\LLMHarness\ApplyMode` を登録し、WSL からは `mode.json` に値を書いてタスクを起動するだけにしています (値は厳密に検証され、任意コマンドは実行できません)。
+
+## リモートアクセスとセキュリティ
+
+1. 初回アクセス (**ワークステーション上の localhost からのみ**) で管理者ユーザーとパスワード (12 文字以上) を設定。
+2. 「セキュリティ」画面で二段階認証 (TOTP) を有効化することを強く推奨。
+3. 「リモートアクセス」画面でトンネルを選んで開始。`cloudflared` / `ngrok` は必要なら自動で導入されます。
+   - Cloudflare quick tunnel: アカウント不要、再起動で URL が変わる
+   - Cloudflare token tunnel / ngrok authtoken: 固定ドメイン。トークンは環境変数でのみ子プロセスに渡し、コマンドラインやログには出しません
+4. 表示された URL (QR コード付き) を外部端末で開き、ログイン。
+
+設計上の安全策: 認証が未設定ならトンネルを開始しない / 既定の bind は `127.0.0.1` / パスワードは argon2id / セッション Cookie は
+`HttpOnly; SameSite=Strict` + 状態変更には `X-Harness-CSRF` ヘッダ必須 / ログイン試行のレート制限 / `auth.json` が壊れていたら fail-closed /
+`X-Forwarded-*` が付いたリクエストは「ローカル」と見なさない。
+
+> トンネルはプロセス起動やファイル削除ができる管理 API を公開します。2FA の有効化に加え、Cloudflare Access (ゼロトラスト) の併用を推奨します。
+
+パスワードを忘れた / 端末を紛失した場合は、ワークステーション上で:
+
+```bash
+llm-harness auth set-password --user admin   # stdin から新パスワードを読む。ハーネスを再起動
+llm-harness auth disable-totp
+```
 
 ## セットアップ
 
@@ -74,7 +123,7 @@ cd ~/llm-harness
 bash scripts/wsl/setup.sh        # apt / CUDA Toolkit (wsl-ubuntu) / uv / Node / systemd 有効化 (sudo)
 # 表示に従って Windows 側で `wsl --shutdown` → 再度 Ubuntu を開く
 
-./harness.sh install             # Python venv + UI ビルド
+./harness.sh install             # UI ビルド + cargo build --release (target-cpu=native)
 ./harness.sh                     # http://localhost:8787 を Windows のブラウザで開く
 ```
 
@@ -127,53 +176,44 @@ KV キャッシュ見積り: `層数 × context × 並列数 × KVヘッド数 �
 
 ## API
 
-すべて `http://localhost:8787/api` 以下。FastAPI の自動ドキュメントが `/docs` にあります。
+すべて `/api` 以下 (`/api/health` を除き認証必須。変更系は `X-Harness-CSRF: 1` ヘッダ、または `Authorization: Bearer lh_...`)。
 
 | メソッド | パス | 説明 |
 | --- | --- | --- |
+| POST | `/auth/setup\|login\|logout\|password`, `/auth/totp/*`, `/auth/keys`, `/auth/sessions` | 認証 |
+| GET/PUT | `/mode`, `/mode/settings` | FULL / SHARED モード |
+| GET/PUT/POST | `/tunnel`, `/tunnel/config\|start\|stop\|install\|logs` | トンネル |
+| GET/POST | `/catalog`, `/catalog/plan\|install\|uninstall` | モデルカタログ |
 | GET | `/system`, `/system/checks` | テレメトリ、環境チェック |
-| GET | `/hf/search?q=`, `/hf/files/{repo}` | HF 検索、ファイル一覧 |
-| GET/POST | `/downloads`, `/downloads/hf`, `/downloads/ollama` | キュー一覧、追加 |
-| POST | `/downloads/{id}/pause\|resume\|cancel` | 制御 |
+| GET/POST | `/downloads`, `/hf/search` ほか | ダウンロードキュー |
 | GET/DELETE | `/models`, `/models/{id}` | ローカル在庫 |
 | POST | `/tune` | 起動パラメータ提案 |
-| GET/POST | `/instances`, `/instances/{id}/stop`, `/instances/{id}/logs?since=` | サーバ管理 |
-| GET/POST | `/profiles` | 起動プロファイル |
-| GET/POST | `/runtimes`, `/jobs`, `/jobs/{id}` | ランタイム状態、セットアップジョブ |
+| GET/POST | `/instances`, `/profiles`, `/runtimes`, `/jobs` | サーバ / プロファイル / ランタイム |
+| ANY | `/v1/*` (`/api` の外) | OpenAI 互換プロキシ |
 
 ## 開発
 
 ```bash
-./harness.sh dev                         # API (:8787, reload) + Vite (:5173)
-cd backend && .venv/bin/python -m pytest # バックエンドのテスト
+./harness.sh dev                              # API (:8787) + Vite (:5173)
+cd backend && cargo test && cargo clippy --all-targets -- -D warnings
+bash tests/e2e/run.sh                         # release バイナリを起動して認証/モード切替を通しで検証
 cd frontend && npx shadcn@latest add <component>
 ```
 
 ```
-backend/harness/
-  main.py        FastAPI ルーティング
-  downloads.py   分割並列ダウンロード / 再開 / sha256 検証 / Ollama pull
-  gguf.py        GGUF メタデータリーダ
-  models.py      モデル在庫
-  tuning.py      llama.cpp パラメータ自動計算
-  runtimes.py    ランタイム検出・コマンド生成・メトリクス
-  instances.py   サーバプロセス管理・プロファイル
-  procs.py       子プロセス + ログ収集
-  system.py      GPU/CPU/メモリ テレメトリと環境チェック
-frontend/src/
-  pages/         dashboard / downloads / models / servers / runtimes / settings
-  components/    launch-dialog, log-viewer, ui/ (shadcn)
-scripts/
-  windows/setup-host.ps1
-  wsl/setup.sh, build-llama-cpp.sh, install-vllm.sh, install-ollama.sh, install-service.sh
+backend/src/
+  main.rs        ルーティング、CLI (auth set-password)、フロント埋め込み
+  auth.rs        認証 (argon2id / セッション / API キー / TOTP / レート制限)
+  mode.rs power.rs affinity.rs topology.rs   FULL/SHARED モードと Windows 橋渡し
+  tunnel.rs      cloudflared / ngrok の監督
+  catalog.rs proxy.rs                        モデルカタログ、/v1 プロキシ
+  downloads.rs hf.rs                         分割並列ダウンロード / HF クライアント
+  gguf.rs models.rs tuning.rs                GGUF リーダ、在庫、自動チューニング
+  instances.rs runtimes.rs procs.rs system.rs
+frontend/src/    pages/ (dashboard downloads models servers runtimes mode remote security settings), components/, lib/
+scripts/         windows/{setup-host,apply-mode}.ps1, wsl/*.sh
+tests/e2e/run.sh
 ```
-
-## セキュリティ
-
-ハーネスはプロセス起動やファイル削除ができる管理 API を **認証なし** で提供します。そのため既定ではハーネスも
-起動するモデルサーバも `127.0.0.1` に bind します (WSL の localhost 転送 / mirrored ネットワークにより Windows 側からは
-`http://localhost:8787` で開けます)。LAN の別マシンから使う場合のみ `HOST=0.0.0.0 ./harness.sh` とし、
-設定画面の「サーバの bind アドレス」も変更してください。信頼できないネットワークでは公開しないでください。
 
 ## License
 
