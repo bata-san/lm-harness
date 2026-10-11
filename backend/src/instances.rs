@@ -120,6 +120,11 @@ impl Instance {
         self.proc.alive()
     }
 
+    /// Health check has passed (the server answers requests).
+    pub fn ready(&self) -> bool {
+        self.live.lock().ready
+    }
+
     /// JSON the frontend's `Instance` type reads; `current` is the mode in force now.
     pub fn to_json(&self, current: Mode) -> Value {
         let alive = self.alive();
@@ -180,7 +185,7 @@ impl InstanceManager {
         self.instances.lock().iter().find(|i| i.id() == id).cloned()
     }
 
-    fn alive_instances(&self) -> Vec<Arc<Instance>> {
+    pub fn alive_instances(&self) -> Vec<Arc<Instance>> {
         self.instances.lock().iter().filter(|i| i.alive()).cloned().collect()
     }
 

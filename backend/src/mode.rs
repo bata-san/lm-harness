@@ -1,11 +1,11 @@
 //! Performance modes.
 //!
 //! * `Full`   — the workstation is dedicated to inference: every core, all VRAM, stock GPU
-//!              power limit, unthrottled downloads.
+//!   power limit, unthrottled downloads.
 //! * `Shared` — someone is using the workstation: inference is pinned to a subset of cores
-//!              with a lower priority, VRAM is reserved for the desktop, the GPU power limit
-//!              is lowered, smaller micro-batches keep the desktop compositor responsive and
-//!              downloads are rate limited.
+//!   with a lower priority, VRAM is reserved for the desktop, the GPU power limit
+//!   is lowered, smaller micro-batches keep the desktop compositor responsive and
+//!   downloads are rate limited.
 //!
 //! A `ModeProfile` is the fully resolved set of limits for the current mode. It is broadcast
 //! through a `tokio::sync::watch` channel (see `AppState::mode_rx`) so every subsystem reacts

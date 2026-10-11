@@ -41,7 +41,7 @@ fn online_cpus() -> usize {
         .map(|s| {
             s.trim()
                 .split(',')
-                .filter_map(|r| r.split('-').last()?.parse::<usize>().ok())
+                .filter_map(|r| r.split('-').next_back()?.parse::<usize>().ok())
                 .max()
                 .map_or(0, |m| m + 1)
         })

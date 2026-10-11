@@ -492,6 +492,10 @@ async fn put_settings(State(state): State<AppState>, Json(patch): Json<Value>) -
     Ok(Json(state.power.snapshot(&state).await))
 }
 
+fn iso_to_unix(s: &str) -> Option<f64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis() as f64 / 1000.0)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -614,8 +618,4 @@ mod tests {
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
     }
-}
-
-fn iso_to_unix(s: &str) -> Option<f64> {
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis() as f64 / 1000.0)
 }
