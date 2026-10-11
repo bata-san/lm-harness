@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react"
-import { BoxesIcon, DownloadIcon, GaugeIcon, MoonIcon, ServerIcon, SettingsIcon, SlidersHorizontalIcon, SunIcon, WrenchIcon } from "lucide-react"
+import { BoxesIcon, DownloadIcon, GaugeIcon, GlobeIcon, KeyRoundIcon, LockKeyholeIcon, LogOutIcon, MoonIcon, ServerIcon, SettingsIcon, ShieldCheckIcon, ShieldIcon, SlidersHorizontalIcon, SunIcon, UserIcon, WrenchIcon } from "lucide-react"
 
 import { MODE_ICON, ModeSwitch } from "@/components/mode-switch"
 import { Button } from "@/components/ui/button"
+import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
@@ -18,18 +19,22 @@ import {
   SidebarMenuItem,
   SidebarProvider,
   SidebarTrigger,
+  useSidebar,
 } from "@/components/ui/sidebar"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { usePoll, type Download, type Instance, type SystemSnapshot } from "@/lib/api"
+import { AuthGate, useAuth } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 import { MODE_LABEL, MODE_STYLE, ModeProvider, profileSummary, useMode } from "@/lib/mode"
 import { DashboardPage } from "@/pages/dashboard"
 import { DownloadsPage } from "@/pages/downloads"
 import { ModePage } from "@/pages/mode"
 import { ModelsPage } from "@/pages/models"
+import { RemotePage } from "@/pages/remote"
 import { RuntimesPage } from "@/pages/runtimes"
 import { ServersPage } from "@/pages/servers"
+import { SecurityPage } from "@/pages/security"
 import { SettingsPage } from "@/pages/settings"
 
 const PAGES = {
@@ -38,12 +43,14 @@ const PAGES = {
   models: { title: "モデル", icon: BoxesIcon, el: ModelsPage },
   servers: { title: "サーバ", icon: ServerIcon, el: ServersPage },
   mode: { title: "モード", icon: SlidersHorizontalIcon, el: ModePage },
+  remote: { title: "リモートアクセス", icon: GlobeIcon, el: RemotePage },
+  security: { title: "セキュリティ", icon: ShieldIcon, el: SecurityPage },
   runtimes: { title: "ランタイム", icon: WrenchIcon, el: RuntimesPage },
   settings: { title: "設定", icon: SettingsIcon, el: SettingsPage },
 } as const
 type PageId = keyof typeof PAGES
 
-function useHashRoute(): [PageId, (p: PageId) => void] {
+function useHashRoute(): [PageId, (p: PageId, anchor?: string) => void] {
   const read = () => {
     const h = location.hash.slice(1)
     return (h in PAGES ? h : "dashboard") as PageId
@@ -54,7 +61,14 @@ function useHashRoute(): [PageId, (p: PageId) => void] {
     addEventListener("hashchange", on)
     return () => removeEventListener("hashchange", on)
   }, [])
-  return [page, (p) => (location.hash = p)]
+  return [
+    page,
+    (p, anchor) => {
+      location.hash = p
+      // Scroll to a section of the target page once it has rendered.
+      if (anchor) setTimeout(() => document.getElementById(anchor)?.scrollIntoView({ behavior: "smooth", block: "start" }), 150)
+    },
+  ]
 }
 
 function ThemeToggle() {
@@ -77,6 +91,85 @@ function ThemeToggle() {
     >
       {dark ? <SunIcon /> : <MoonIcon />}
     </Button>
+  )
+}
+
+/** Sidebar entries; closes the mobile sheet after navigating. */
+function NavItems({ page, go, badges }: { page: PageId; go: (p: PageId) => void; badges: Partial<Record<PageId, number>> }) {
+  const { isMobile, setOpenMobile } = useSidebar()
+  return (
+    <SidebarMenu>
+      {(Object.keys(PAGES) as PageId[]).map((id) => {
+        const P = PAGES[id]
+        return (
+          <SidebarMenuItem key={id}>
+            <SidebarMenuButton
+              isActive={page === id}
+              tooltip={P.title}
+              onClick={() => {
+                go(id)
+                if (isMobile) setOpenMobile(false)
+              }}
+            >
+              <P.icon />
+              <span>{P.title}</span>
+            </SidebarMenuButton>
+            {badges[id] ? <SidebarMenuBadge>{badges[id]}</SidebarMenuBadge> : null}
+          </SidebarMenuItem>
+        )
+      })}
+    </SidebarMenu>
+  )
+}
+
+function UserMenu({ go }: { go: (p: PageId, anchor?: string) => void }) {
+  const { status, logout } = useAuth()
+  const [pending, setPending] = useState(false)
+  const isKey = status.principal_kind === "api_key" || status.principal_kind === "local"
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger render={<Button variant="ghost" size="sm" className="max-w-40 gap-1.5 px-2" aria-label="ユーザーメニュー" />}>
+        <UserIcon />
+        <span className="hidden truncate sm:inline">{status.user ?? "ユーザー"}</span>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-56">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="truncate">
+            {status.user ?? "ユーザー"}
+            {status.local && <span className="ml-1 font-normal text-muted-foreground">(ローカル)</span>}
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => go("security", "password")}>
+          <LockKeyholeIcon /> パスワード変更
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => go("security", "totp")}>
+          <ShieldCheckIcon /> 二段階認証
+          {!status.totp_enabled && <span className="ml-auto text-[10px] text-amber-600 dark:text-amber-400">未設定</span>}
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => go("security", "keys")}>
+          <KeyRoundIcon /> API キー
+        </DropdownMenuItem>
+        {!isKey && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={pending}
+              onClick={async () => {
+                setPending(true)
+                try {
+                  await logout()
+                } finally {
+                  setPending(false)
+                }
+              }}
+            >
+              <LogOutIcon /> ログアウト
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -109,20 +202,7 @@ function Shell() {
           <SidebarContent>
             <SidebarGroup>
               <SidebarGroupContent>
-                <SidebarMenu>
-                  {(Object.keys(PAGES) as PageId[]).map((id) => {
-                    const P = PAGES[id]
-                    return (
-                      <SidebarMenuItem key={id}>
-                        <SidebarMenuButton isActive={page === id} tooltip={P.title} onClick={() => setPage(id)}>
-                          <P.icon />
-                          <span>{P.title}</span>
-                        </SidebarMenuButton>
-                        {badges[id] ? <SidebarMenuBadge>{badges[id]}</SidebarMenuBadge> : null}
-                      </SidebarMenuItem>
-                    )
-                  })}
-                </SidebarMenu>
+                <NavItems page={page} go={setPage} badges={badges} />
               </SidebarGroupContent>
             </SidebarGroup>
           </SidebarContent>
@@ -147,29 +227,34 @@ function Shell() {
           </SidebarFooter>
         </Sidebar>
         <SidebarInset>
-          <header className="sticky top-0 z-10 flex h-14 items-center gap-2 border-b bg-background/80 px-4 backdrop-blur">
+          <header className="sticky top-0 z-10 flex h-14 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur sm:px-4">
             <SidebarTrigger className="-ml-1" />
-            <Separator orientation="vertical" className="mr-2 data-[orientation=vertical]:h-4" />
-            <h1 className="font-medium">{PAGES[page].title}</h1>
-            <div className="ml-auto flex items-center gap-3">
+            <Separator orientation="vertical" className="mr-1 data-[orientation=vertical]:h-4 sm:mr-2" />
+            <h1 className="min-w-0 truncate font-medium">{PAGES[page].title}</h1>
+            <div className="ml-auto flex shrink-0 items-center gap-1.5 sm:gap-3">
               <ModeSwitch />
               <ThemeToggle />
+              <UserMenu go={setPage} />
             </div>
           </header>
-          <main className="p-4 md:p-6">
+          <main className="min-w-0 p-3 sm:p-4 md:p-6">
             <Page />
           </main>
         </SidebarInset>
       </SidebarProvider>
-      <Toaster richColors position="bottom-right" />
     </TooltipProvider>
   )
 }
 
 export default function App() {
   return (
-    <ModeProvider>
-      <Shell />
-    </ModeProvider>
+    <>
+      <AuthGate>
+        <ModeProvider>
+          <Shell />
+        </ModeProvider>
+      </AuthGate>
+      <Toaster richColors position="bottom-right" />
+    </>
   )
 }

@@ -1,23 +1,53 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
+export class ApiError extends Error {
+  status: number
+  totpRequired: boolean
+  constructor(message: string, status: number, totpRequired = false) {
+    super(message)
+    this.name = "ApiError"
+    this.status = status
+    this.totpRequired = totpRequired
+  }
+}
+
+// Any 401 is broadcast so the AuthGate can re-check the session and show the login screen.
+const unauthorizedListeners = new Set<() => void>()
+export function onUnauthorized(fn: () => void): () => void {
+  unauthorizedListeners.add(fn)
+  return () => {
+    unauthorizedListeners.delete(fn)
+  }
+}
+
 export async function api<T = unknown>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
-  const { json, ...rest } = init ?? {}
+  const { json, headers, ...rest } = init ?? {}
+  const h = new Headers(headers)
+  if (json !== undefined) h.set("content-type", "application/json")
+  // CSRF guard required by the backend for every request (harmless on GET).
+  h.set("X-Harness-CSRF", "1")
   const res = await fetch(`/api${path}`, {
     ...rest,
-    headers: json !== undefined ? { "content-type": "application/json", ...rest.headers } : rest.headers,
+    credentials: "same-origin",
+    headers: h,
     body: json !== undefined ? JSON.stringify(json) : rest.body,
   })
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`
+    let totp = false
     try {
       const body = await res.json()
       msg = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail ?? body)
+      totp = body.totp_required === true
     } catch {
       /* not json */
     }
-    throw new Error(msg)
+    if (res.status === 401) unauthorizedListeners.forEach((fn) => fn())
+    throw new ApiError(msg, res.status, totp)
   }
-  return res.json() as Promise<T>
+  if (res.status === 204) return undefined as T
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
 }
 
 /** Poll an endpoint; refetch() forces an immediate reload. */
@@ -254,3 +284,59 @@ export type ModeState = {
   restarted: string[]
   topology: { physical_cores: number; logical_cores: number }
 }
+
+// ---- auth ----
+export type AuthStatus = {
+  configured: boolean
+  authenticated: boolean
+  user: string | null
+  totp_enabled: boolean
+  local: boolean
+  principal_kind: string | null
+}
+export type AuthSession = { id: string; created_at: number; last_seen_at: number; ip: string; user_agent: string; current: boolean }
+export type ApiKey = { id: string; name: string; prefix: string; created_at: number; last_used_at: number | null }
+
+// ---- tunnel ----
+export type TunnelProvider = "cloudflare_quick" | "cloudflare_token" | "ngrok"
+export type TunnelState = "stopped" | "installing" | "starting" | "connected" | "degraded" | "restarting" | "error"
+export type TunnelConfig = {
+  provider: TunnelProvider
+  autostart: boolean
+  cloudflare_token: string
+  cloudflare_hostname: string
+  ngrok_authtoken: string
+  ngrok_domain: string
+}
+export type TunnelStatus = {
+  state: TunnelState
+  provider: TunnelProvider
+  public_url: string | null
+  connected_since: number | null
+  restarts: number
+  last_error: string | null
+  last_health: { ok: boolean; at: number; latency_ms: number } | null
+  auth_configured: boolean
+  binaries: { cloudflared: { path: string; version: string | null } | null; ngrok: { path: string; version: string | null } | null }
+  config: TunnelConfig
+}
+
+// ---- catalog ----
+export type Fit = "gpu" | "moe_offload" | "partial" | "cpu" | "too_big"
+export type CatalogItem = {
+  id: string
+  downloads: number
+  likes: number
+  updated: string | number | null
+  created_at: string | number | null
+  pipeline_tag?: string | null
+  tags: string[]
+  installed: boolean
+  best: { quant: string; size: number; fit: Fit; files: number } | null
+}
+export type CatalogPlan = {
+  repo: string
+  recommended_quant: string | null
+  options: { quant: string; size: number; files: { path: string; size: number; sha256?: string | null }[]; fit: Fit; recommended: boolean; note: string }[]
+}
+export type UninstallResult = { stopped: string[]; profiles_removed: number; freed_bytes: number }

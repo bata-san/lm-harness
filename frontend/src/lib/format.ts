@@ -34,3 +34,36 @@ export function splitArgs(s: string): string[] {
 export function joinArgs(a: string[]): string {
   return a.map((t) => (/\s/.test(t) ? `"${t}"` : t)).join(" ")
 }
+
+/** Unix timestamp (seconds or ms) / ISO string -> epoch seconds. */
+export function toEpoch(t: number | string | null | undefined): number | null {
+  if (t == null) return null
+  if (typeof t === "string") {
+    const ms = Date.parse(t)
+    return Number.isFinite(ms) ? ms / 1000 : null
+  }
+  return t > 1e12 ? t / 1000 : t
+}
+
+export function dateTime(t: number | string | null | undefined): string {
+  const e = toEpoch(t)
+  return e == null ? "—" : new Date(e * 1000).toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" })
+}
+
+/** "3 分前" style relative time. */
+export function ago(t: number | string | null | undefined): string {
+  const e = toEpoch(t)
+  if (e == null) return "—"
+  const s = Math.max(0, Date.now() / 1000 - e)
+  if (s < 60) return "たった今"
+  if (s < 3600) return `${Math.floor(s / 60)} 分前`
+  if (s < 86400) return `${Math.floor(s / 3600)} 時間前`
+  if (s < 86400 * 60) return `${Math.floor(s / 86400)} 日前`
+  return dateTime(t)
+}
+
+export function compact(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
+  return String(n)
+}
