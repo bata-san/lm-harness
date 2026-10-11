@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
-import { BoxesIcon, DownloadIcon, GaugeIcon, MoonIcon, ServerIcon, SettingsIcon, SunIcon, WrenchIcon } from "lucide-react"
+import { BoxesIcon, DownloadIcon, GaugeIcon, MoonIcon, ServerIcon, SettingsIcon, SlidersHorizontalIcon, SunIcon, WrenchIcon } from "lucide-react"
 
+import { MODE_ICON, ModeSwitch } from "@/components/mode-switch"
 import { Button } from "@/components/ui/button"
 import { Separator } from "@/components/ui/separator"
 import {
@@ -21,8 +22,11 @@ import {
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { usePoll, type Download, type Instance, type SystemSnapshot } from "@/lib/api"
+import { cn } from "@/lib/utils"
+import { MODE_LABEL, MODE_STYLE, ModeProvider, profileSummary, useMode } from "@/lib/mode"
 import { DashboardPage } from "@/pages/dashboard"
 import { DownloadsPage } from "@/pages/downloads"
+import { ModePage } from "@/pages/mode"
 import { ModelsPage } from "@/pages/models"
 import { RuntimesPage } from "@/pages/runtimes"
 import { ServersPage } from "@/pages/servers"
@@ -33,6 +37,7 @@ const PAGES = {
   downloads: { title: "ダウンロード", icon: DownloadIcon, el: DownloadsPage },
   models: { title: "モデル", icon: BoxesIcon, el: ModelsPage },
   servers: { title: "サーバ", icon: ServerIcon, el: ServersPage },
+  mode: { title: "モード", icon: SlidersHorizontalIcon, el: ModePage },
   runtimes: { title: "ランタイム", icon: WrenchIcon, el: RuntimesPage },
   settings: { title: "設定", icon: SettingsIcon, el: SettingsPage },
 } as const
@@ -75,7 +80,8 @@ function ThemeToggle() {
   )
 }
 
-export default function App() {
+function Shell() {
+  const { state: mode } = useMode()
   const [page, setPage] = useHashRoute()
   const { data: sys } = usePoll<SystemSnapshot>("/system", 3000)
   const { data: dls } = usePoll<Download[]>("/downloads", 3000)
@@ -121,6 +127,15 @@ export default function App() {
             </SidebarGroup>
           </SidebarContent>
           <SidebarFooter className="group-data-[collapsible=icon]:hidden">
+            {mode && (
+              <a href="#mode" className={cn("rounded-lg border p-2 text-xs", MODE_STYLE[mode.mode].border, MODE_STYLE[mode.mode].bg)}>
+                <div className={cn("flex items-center gap-1.5 font-medium", MODE_STYLE[mode.mode].text)}>
+                  {mode.mode === "full" ? <MODE_ICON.full className="size-3.5" /> : <MODE_ICON.shared className="size-3.5" />}
+                  {MODE_LABEL[mode.mode]}
+                </div>
+                <div className="text-muted-foreground tabular-nums">{profileSummary(mode)}</div>
+              </a>
+            )}
             {gpu && (
               <div className="rounded-lg border p-2 text-xs">
                 <div className="truncate font-medium">{gpu.name}</div>
@@ -136,7 +151,8 @@ export default function App() {
             <SidebarTrigger className="-ml-1" />
             <Separator orientation="vertical" className="mr-2 data-[orientation=vertical]:h-4" />
             <h1 className="font-medium">{PAGES[page].title}</h1>
-            <div className="ml-auto">
+            <div className="ml-auto flex items-center gap-3">
+              <ModeSwitch />
               <ThemeToggle />
             </div>
           </header>
@@ -147,5 +163,13 @@ export default function App() {
       </SidebarProvider>
       <Toaster richColors position="bottom-right" />
     </TooltipProvider>
+  )
+}
+
+export default function App() {
+  return (
+    <ModeProvider>
+      <Shell />
+    </ModeProvider>
   )
 }

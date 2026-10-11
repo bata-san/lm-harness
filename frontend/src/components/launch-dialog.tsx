@@ -13,6 +13,7 @@ import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { api, usePoll, type LocalModel, type Profile, type TuneResult } from "@/lib/api"
 import { bytes, joinArgs, pct, splitArgs } from "@/lib/format"
+import { MODE_LABEL, useMode } from "@/lib/mode"
 
 const RUNTIMES = [
   { id: "llama.cpp", label: "llama.cpp (llama-server)" },
@@ -42,6 +43,9 @@ export function LaunchDialog({
   const [parallel, setParallel] = useState("1")
   const [tune, setTune] = useState<TuneResult | null>(null)
   const [autostart, setAutostart] = useState(false)
+  const [autoTuneOn, setAutoTuneOn] = useState(true)
+  const { state: modeState } = useMode()
+  const modeName = modeState?.mode
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
@@ -52,11 +56,15 @@ export function LaunchDialog({
     setPort(initial?.port ? String(initial.port) : "")
     setArgs(joinArgs(initial?.args ?? []))
     setAutostart(initial?.autostart ?? false)
+    setAutoTuneOn(initial?.auto_tune ?? true)
     setTune(null)
   }, [open, initial])
 
   const candidates = useMemo(() => (models ?? []).filter((m) => m.runtimes.includes(runtime) && runtime !== "ollama"), [models, runtime])
   const selected = candidates.find((m) => m.id === model)
+
+  // true when the backend computes the tuned args itself and `args` are only user overrides
+  const autoManaged = autoTuneOn && runtime !== "ollama"
 
   async function autoTune() {
     if (!model) return toast.error("モデルを選択してください")
@@ -66,8 +74,10 @@ export function LaunchDialog({
         json: { model, ctx: ctx ? Number(ctx) : null, kv_type: kv, parallel: Number(parallel) || 1 },
       })
       setTune(r)
-      setArgs(joinArgs(r.args))
-      if (r.estimate.ctx) setCtx(String(r.estimate.ctx))
+      if (!autoManaged) {
+        setArgs(joinArgs(r.args))
+        if (r.estimate.ctx) setCtx(String(r.estimate.ctx))
+      }
     } catch (e) {
       toast.error((e as Error).message)
     }
@@ -75,9 +85,28 @@ export function LaunchDialog({
 
   // Auto-tune as soon as a GGUF model is picked so the defaults are already sensible.
   useEffect(() => {
-    if (open && runtime === "llama.cpp" && model && !initial?.args?.length) autoTune()
+    if (open && runtime === "llama.cpp" && model && (autoManaged || !initial?.args?.length)) autoTune()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [model, runtime, open])
+  }, [model, runtime, open, modeName, autoManaged])
+
+  function toggleAutoTune(on: boolean) {
+    setAutoTuneOn(on)
+    if (on) setArgs("")
+    else if (tune) setArgs(joinArgs(tune.args))
+  }
+
+  /** In auto mode the dialog's own fields become explicit overrides on top of the tuned args. */
+  function effectiveArgs(): string[] {
+    const user = splitArgs(args)
+    if (!autoManaged || runtime !== "llama.cpp") return user
+    const has = (...flags: string[]) => user.some((a) => flags.includes(a))
+    const extra: string[] = []
+    if (ctx && !has("-c", "--ctx-size")) extra.push("-c", ctx)
+    if (!has("-ctk", "--cache-type-k")) extra.push("-ctk", kv)
+    if (!has("-ctv", "--cache-type-v")) extra.push("-ctv", kv)
+    if (Number(parallel) > 0 && !has("-np", "--parallel")) extra.push("-np", String(Number(parallel)))
+    return [...user, ...extra]
+  }
 
   const spec = (): Profile => ({
     ...(initial?.id ? { id: initial.id } : {}),
@@ -85,9 +114,10 @@ export function LaunchDialog({
     runtime,
     model: runtime === "ollama" ? "" : model,
     port: port ? Number(port) : null,
-    args: splitArgs(args),
+    args: effectiveArgs(),
     env: initial?.env ?? {},
     autostart,
+    auto_tune: autoManaged,
   })
 
   async function launch() {
@@ -203,7 +233,7 @@ export function LaunchDialog({
           {tune && est?.vram_total ? (
             <div className="space-y-2 rounded-lg border p-3">
               <Meter
-                label={`VRAM 見積り (モデル ${bytes(est.model_bytes)} + KV ${bytes(est.kv_bytes)})`}
+                label={`VRAM 見積り (モデル ${bytes(est.model_bytes)} + KV ${bytes(est.kv_bytes)}${est.vram_reserve ? ` · デスクトップ用予約 ${bytes(est.vram_reserve)}` : ""})`}
                 value={pct(need, est.vram_free ?? 0)}
                 detail={`${bytes(need)} / 空き ${bytes(est.vram_free)}`}
                 tone={est.fits ? undefined : "danger"}
@@ -220,9 +250,37 @@ export function LaunchDialog({
             </Alert>
           ) : null}
 
+          {runtime !== "ollama" && (
+            <div className="flex items-start gap-2">
+              <Switch checked={autoTuneOn} onCheckedChange={toggleAutoTune} id="auto_tune" className="mt-0.5" />
+              <div className="grid gap-0.5">
+                <Label htmlFor="auto_tune" className="font-normal">
+                  自動チューニング (モードに追従)
+                </Label>
+                <span className="text-xs text-muted-foreground">
+                  現在のモード{modeName ? ` (${MODE_LABEL[modeName]})` : ""}の制限に合わせて引数を計算し、モード切替時の再起動でも再計算します。
+                </span>
+              </div>
+            </div>
+          )}
+
+          {autoManaged && tune && tune.args.length > 0 && (
+            <div className="grid gap-1.5">
+              <Label className="text-muted-foreground">チューニング結果 (読み取り専用)</Label>
+              <code className="block max-h-28 overflow-y-auto rounded bg-muted px-2 py-1.5 font-mono text-[11px] break-all whitespace-pre-wrap text-muted-foreground">
+                {joinArgs(tune.args)}
+              </code>
+            </div>
+          )}
+
           <div className="grid gap-1.5">
-            <Label>追加引数</Label>
-            <Textarea className="min-h-20 font-mono text-xs" value={args} onChange={(e) => setArgs(e.target.value)} />
+            <Label>{autoManaged ? "上書き引数 (任意)" : "追加引数"}</Label>
+            <Textarea
+              className="min-h-20 font-mono text-xs"
+              value={args}
+              placeholder={autoManaged ? "例: --n-gpu-layers 20" : undefined}
+              onChange={(e) => setArgs(e.target.value)}
+            />
           </div>
 
           <div className="flex items-center gap-2">
