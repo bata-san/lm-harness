@@ -45,7 +45,8 @@ if ! grep -q 'systemd=true' /etc/wsl.conf 2>/dev/null; then
 fi
 
 echo "==> mlock 上限を解除 (llama.cpp --mlock でモデルをスワップさせない)"
-echo -e "*  soft  memlock  unlimited\n*  hard  memlock  unlimited" | sudo tee /etc/security/limits.d/90-llm.conf >/dev/null
+# nice 0: 共有モード (nice 10) からフル性能に戻すとき、一般ユーザーでも優先度を元に戻せるようにする
+echo -e "*  soft  memlock  unlimited\n*  hard  memlock  unlimited\n*  -     nice     0" | sudo tee /etc/security/limits.d/90-llm.conf >/dev/null
 
 echo "==> スワップしにくくする"
 echo "vm.swappiness=10" | sudo tee /etc/sysctl.d/90-llm.conf >/dev/null

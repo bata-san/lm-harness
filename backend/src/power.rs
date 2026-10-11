@@ -419,11 +419,12 @@ impl PowerManager {
         json!({
             "mode": profile.mode,
             "source": st.source,
-            "switched_at": st.switched_at,
+            // unix seconds (what the frontend formats)
+            "switched_at": iso_to_unix(&st.switched_at),
             "profile": profile,
             "settings": settings.mode,
             "scheduled_mode": scheduled,
-            "next_switch_at": next_switch,
+            "next_switch_at": next_switch.as_deref().and_then(iso_to_unix),
             "bridge": {
                 "available": avail.available,
                 "message": avail.message,
@@ -613,4 +614,8 @@ mod tests {
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("8"), None);
     }
+}
+
+fn iso_to_unix(s: &str) -> Option<f64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis() as f64 / 1000.0)
 }

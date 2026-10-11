@@ -14,6 +14,8 @@ ExecStart=$ROOT/backend/target/release/llm-harness --host 127.0.0.1 --port 8787
 Environment=HARNESS_REPO=$ROOT
 Restart=on-failure
 LimitMEMLOCK=infinity
+# raw RLIMIT_NICE 20 = 優先度を nice 0 まで戻せる (共有→フル切替用)
+LimitNICE=20
 Environment=PATH=/usr/local/cuda/bin:/usr/lib/wsl/lib:/usr/local/bin:/usr/bin:/bin
 
 [Install]
