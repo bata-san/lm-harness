@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 *.tsbuildinfo
 .DS_Store
+
+# rust
+backend/target/
