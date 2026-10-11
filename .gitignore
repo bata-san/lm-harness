@@ -9,3 +9,4 @@ __pycache__/
 
 # rust
 backend/target/
+.claude/

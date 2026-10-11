@@ -9,8 +9,9 @@ Description=LLM Harness
 After=network-online.target
 
 [Service]
-WorkingDirectory=$ROOT/backend
-ExecStart=$ROOT/backend/.venv/bin/python -m harness --host 127.0.0.1 --port 8787
+WorkingDirectory=$ROOT
+ExecStart=$ROOT/backend/target/release/llm-harness --host 127.0.0.1 --port 8787
+Environment=HARNESS_REPO=$ROOT
 Restart=on-failure
 LimitMEMLOCK=infinity
 Environment=PATH=/usr/local/cuda/bin:/usr/lib/wsl/lib:/usr/local/bin:/usr/bin:/bin
