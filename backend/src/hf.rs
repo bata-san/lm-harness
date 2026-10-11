@@ -101,6 +101,7 @@ pub struct HfRepo {
     pub downloads: u64,
     pub likes: u64,
     pub updated: Option<String>,
+    pub created_at: Option<String>,
     pub pipeline_tag: Option<String>,
     pub tags: Vec<String>,
 }
@@ -125,6 +126,8 @@ struct RawRepo {
     likes: u64,
     #[serde(rename = "lastModified")]
     last_modified: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
     pipeline_tag: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
@@ -183,9 +186,14 @@ async fn check(resp: Response) -> anyhow::Result<Response> {
 
 /// `GET /api/models?search=&sort=downloads&direction=-1&limit=&filter=gguf`
 pub async fn search(settings: &Settings, query: &str, gguf_only: bool, limit: u32) -> anyhow::Result<Vec<HfRepo>> {
+    search_sorted(settings, query, "downloads", gguf_only, limit).await
+}
+
+/// Like [`search`] with an explicit Hub sort key (`downloads`, `trendingScore`, `createdAt`, `lastModified`, `likes`).
+pub async fn search_sorted(settings: &Settings, query: &str, sort: &str, gguf_only: bool, limit: u32) -> anyhow::Result<Vec<HfRepo>> {
     let mut params: Vec<(&str, String)> = vec![
         ("search", query.to_string()),
-        ("sort", "downloads".into()),
+        ("sort", sort.to_string()),
         ("direction", "-1".into()),
         ("limit", limit.to_string()),
     ];
@@ -203,6 +211,7 @@ pub async fn search(settings: &Settings, query: &str, gguf_only: bool, limit: u3
                 downloads: m.downloads,
                 likes: m.likes,
                 updated: m.last_modified,
+                created_at: m.created_at,
                 pipeline_tag: m.pipeline_tag,
                 tags: m.tags.into_iter().take(12).collect(),
             })
