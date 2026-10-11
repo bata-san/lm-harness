@@ -1,4 +1,5 @@
 mod affinity;
+mod auth;
 mod config;
 mod downloads;
 mod error;
@@ -13,6 +14,7 @@ mod runtimes;
 mod state;
 mod system;
 mod topology;
+mod tunnel;
 mod tuning;
 mod types;
 
@@ -21,8 +23,9 @@ use std::sync::Arc;
 
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
-use clap::Parser;
+use axum::routing::get;
+use axum::{middleware, Json, Router};
+use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
 use tokio::sync::watch;
 use tower_http::compression::CompressionLayer;
@@ -40,6 +43,46 @@ struct Cli {
     host: String,
     #[arg(long, env = "PORT", default_value_t = 8787)]
     port: u16,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Local recovery for the admin account (run on the workstation itself).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Set (or reset) the admin user's password. Password is read from stdin.
+    SetPassword {
+        #[arg(long, default_value = "admin")]
+        user: String,
+    },
+    /// Turn off TOTP two-factor auth (e.g. lost phone).
+    DisableTotp,
+}
+
+fn run_cli(cmd: Command) -> anyhow::Result<()> {
+    match cmd {
+        Command::Auth { action: AuthAction::SetPassword { user } } => {
+            use std::io::BufRead;
+            eprint!("新しいパスワード (12 文字以上): ");
+            let mut pw = String::new();
+            std::io::stdin().lock().read_line(&mut pw)?;
+            auth::cli_set_password(&user, pw.trim_end_matches(['\r', '\n']))?;
+            eprintln!("パスワードを設定しました。既存のセッションは無効化されます (ハーネスを再起動してください)。");
+        }
+        Command::Auth { action: AuthAction::DisableTotp } => {
+            auth::cli_disable_totp()?;
+            eprintln!("二段階認証を無効化しました。");
+        }
+    }
+    Ok(())
 }
 
 #[derive(RustEmbed)]
@@ -52,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))
         .init();
     let cli = Cli::parse();
+    if let Some(cmd) = cli.command {
+        return run_cli(cmd);
+    }
 
     let settings = Arc::new(SettingsStore::load()?);
     let topo = topology::cpu_topology();
@@ -63,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         downloads: downloads::DownloadManager::load(settings.clone(), mode_rx.clone()),
         instances: instances::InstanceManager::load(settings.clone()),
         power: power::PowerManager::new(settings.clone(), mode_tx),
+        auth: auth::AuthManager::load(),
+        tunnel: tunnel::TunnelManager::load(cli.port),
         settings,
         mode_rx,
     };
@@ -70,16 +118,26 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(state.downloads.clone().run());
     tokio::spawn(state.instances.clone().monitor(state.clone()));
     tokio::spawn(state.power.clone().run(state.clone()));
+    tokio::spawn(state.tunnel.clone().run(state.clone()));
     state.instances.autostart(&state).await;
 
-    let app = Router::new()
+    let api = Router::new()
+        .merge(auth::router())
         .merge(system::router())
         .merge(models::router())
         .merge(tuning::router())
         .merge(downloads::router())
         .merge(instances::router())
         .merge(power::router())
+        .merge(tunnel::router())
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
+
+    let app = Router::new()
+        // Unauthenticated liveness probe (used by the tunnel health check and systemd).
+        .route("/api/health", get(|| async { Json(serde_json::json!({"ok": true, "version": env!("CARGO_PKG_VERSION")})) }))
+        .merge(api)
         .fallback(static_handler)
+        .layer(middleware::from_fn(auth::security_headers))
         .layer(CompressionLayer::new())
         .with_state(state.clone());
 
@@ -87,9 +145,12 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("LLM Harness listening on http://{addr}  (mode: {:?})", state.profile().mode);
 
-    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     tracing::info!("shutting down: stopping servers");
+    state.tunnel.stop().await;
     state.instances.stop_all().await;
     state.downloads.persist();
     Ok(())
