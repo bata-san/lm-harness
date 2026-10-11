@@ -2,6 +2,7 @@ import { useState } from "react"
 import { CopyIcon, PlayIcon, PlusIcon, ScrollTextIcon, SquareIcon, Trash2Icon } from "lucide-react"
 import { toast } from "sonner"
 
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import { LaunchDialog } from "@/components/launch-dialog"
 import { LogViewer } from "@/components/log-viewer"
 import { KV } from "@/components/stat"
@@ -11,6 +12,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { api, usePoll, type Instance, type Profile } from "@/lib/api"
+import { copyText } from "@/lib/clipboard"
 import { since } from "@/lib/format"
 import { MODE_LABEL, MODE_STYLE } from "@/lib/mode"
 import { cn } from "@/lib/utils"
@@ -21,35 +23,36 @@ export function ServersPage() {
   const [launch, setLaunch] = useState<Partial<Profile> | null>(null)
   const [logs, setLogs] = useState<Instance | null>(null)
 
-  async function stop(i: Instance) {
-    await api(`/instances/${i.id}/stop`, { method: "POST" })
-    refetch()
-  }
+  const [stopTarget, setStopTarget] = useState<Instance | null>(null)
+  const [delProfile, setDelProfile] = useState<Profile | null>(null)
+  const [running, setRunning] = useState<string | null>(null)
+
   async function remove(i: Instance) {
-    await api(`/instances/${i.id}`, { method: "DELETE" })
-    refetch()
+    try {
+      await api(`/instances/${i.id}`, { method: "DELETE" })
+      refetch()
+    } catch (e) {
+      toast.error((e as Error).message)
+    }
   }
   async function runProfile(p: Profile) {
+    if (running) return
+    setRunning(p.id ?? p.name)
     try {
       await api("/instances", { method: "POST", json: p })
       toast.success(`${p.name} を起動`)
       refetch()
     } catch (e) {
       toast.error((e as Error).message)
+    } finally {
+      setRunning(null)
     }
   }
-  async function deleteProfile(p: Profile) {
-    await api(`/profiles/${p.id}`, { method: "DELETE" })
-    refetchProfiles()
-  }
-  function copy(text: string) {
-    navigator.clipboard.writeText(text)
-    toast.success("コピーしました")
-  }
+  const copy = (text: string) => void copyText(text)
 
   return (
     <div className="grid gap-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
           WSL の mirrored ネットワークなら Windows 側のアプリからも <code className="font-mono">http://localhost:PORT/v1</code> で接続できます。
         </p>
@@ -97,7 +100,7 @@ export function ServersPage() {
                       <ScrollTextIcon />
                     </Button>
                     {alive ? (
-                      <Button size="icon-sm" variant="ghost" title="停止" onClick={() => stop(i)}>
+                      <Button size="icon-sm" variant="ghost" title="停止" aria-label="停止" onClick={() => setStopTarget(i)}>
                         <SquareIcon />
                       </Button>
                     ) : (
@@ -155,10 +158,10 @@ export function ServersPage() {
                 <Button size="sm" variant="ghost" onClick={() => setLaunch(p)}>
                   編集
                 </Button>
-                <Button size="icon-sm" variant="ghost" title="起動" onClick={() => runProfile(p)}>
+                <Button size="icon-sm" variant="ghost" title="起動" aria-label="起動" disabled={running !== null} onClick={() => runProfile(p)}>
                   <PlayIcon />
                 </Button>
-                <Button size="icon-sm" variant="ghost" title="削除" onClick={() => deleteProfile(p)}>
+                <Button size="icon-sm" variant="ghost" title="削除" aria-label="削除" onClick={() => setDelProfile(p)}>
                   <Trash2Icon />
                 </Button>
               </div>
@@ -173,6 +176,35 @@ export function ServersPage() {
         initial={launch ?? undefined}
         onLaunched={() => {
           refetch()
+          refetchProfiles()
+        }}
+      />
+
+      <ConfirmDialog
+        open={!!stopTarget}
+        onOpenChange={(o) => !o && setStopTarget(null)}
+        title="サーバを停止しますか?"
+        description={stopTarget ? `${stopTarget.name} (${stopTarget.runtime}, :${stopTarget.port})` : undefined}
+        confirmLabel="停止する"
+        onConfirm={async () => {
+          if (!stopTarget) return
+          await api(`/instances/${stopTarget.id}/stop`, { method: "POST" })
+          toast.success(`${stopTarget.name} を停止しました`)
+          refetch()
+        }}
+      >
+        <p className="text-sm text-muted-foreground">処理中のリクエストは中断され、このサーバに接続しているアプリは使えなくなります。</p>
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={!!delProfile}
+        onOpenChange={(o) => !o && setDelProfile(null)}
+        title="プロファイルを削除しますか?"
+        description={delProfile?.name}
+        confirmLabel="削除する"
+        onConfirm={async () => {
+          if (!delProfile) return
+          await api(`/profiles/${delProfile.id}`, { method: "DELETE" })
           refetchProfiles()
         }}
       />

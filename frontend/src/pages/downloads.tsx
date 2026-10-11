@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react"
-import { DownloadIcon, HeartIcon, PauseIcon, PlayIcon, SearchIcon, Trash2Icon, XIcon } from "lucide-react"
+import { DownloadIcon, HeartIcon, Loader2Icon, PauseIcon, PlayIcon, SearchIcon, Trash2Icon, XIcon } from "lucide-react"
 import { toast } from "sonner"
 
+import { CatalogPanel } from "@/components/catalog"
+import { ConfirmDialog } from "@/components/confirm-dialog"
 import { StatusBadge } from "@/components/status-badge"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -12,6 +14,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Progress } from "@/components/ui/progress"
 import { Switch } from "@/components/ui/switch"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { api, usePoll, type Download, type HfFile, type HfRepo } from "@/lib/api"
 import { bytes, duration, pct } from "@/lib/format"
@@ -24,6 +27,9 @@ export function DownloadsPage() {
   const [searching, setSearching] = useState(false)
   const [repo, setRepo] = useState<string | null>(null)
   const [ollamaName, setOllamaName] = useState("")
+  const [pulling, setPulling] = useState(false)
+  const [cancelTarget, setCancelTarget] = useState<Download | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
 
   async function search(e?: React.FormEvent) {
     e?.preventDefault()
@@ -43,88 +49,111 @@ export function DownloadsPage() {
   }
 
   async function act(id: string, action: "pause" | "resume" | "cancel" | "delete") {
+    if (busyId) return
+    setBusyId(id)
     try {
       if (action === "delete") await api(`/downloads/${id}`, { method: "DELETE" })
       else await api(`/downloads/${id}/${action}`, { method: "POST" })
       refetch()
     } catch (err) {
       toast.error((err as Error).message)
+    } finally {
+      setBusyId(null)
     }
   }
 
   async function pullOllama(e: React.FormEvent) {
     e.preventDefault()
-    if (!ollamaName.trim()) return
-    await api("/downloads/ollama", { method: "POST", json: { model: ollamaName.trim() } })
-    setOllamaName("")
-    refetch()
+    if (!ollamaName.trim() || pulling) return
+    setPulling(true)
+    try {
+      await api("/downloads/ollama", { method: "POST", json: { model: ollamaName.trim() } })
+      toast.success(`${ollamaName.trim()} の取得を開始しました`)
+      setOllamaName("")
+      refetch()
+    } catch (err) {
+      toast.error((err as Error).message)
+    } finally {
+      setPulling(false)
+    }
   }
 
   return (
     <div className="grid gap-4">
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card className="lg:col-span-2">
-          <CardHeader>
-            <CardTitle>Hugging Face から取得</CardTitle>
-            <CardDescription>キーワード検索、または「owner/repo」を直接入力。複数接続の分割ダウンロード + 再開 + sha256 検証。</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3">
-            <form onSubmit={search} className="flex flex-wrap items-center gap-2">
-              <Input className="min-w-60 flex-1" placeholder="例: Qwen3 30B GGUF / unsloth/gpt-oss-20b-GGUF" value={q} onChange={(e) => setQ(e.target.value)} />
-              <div className="flex items-center gap-2">
-                <Switch id="gguf" checked={ggufOnly} onCheckedChange={setGgufOnly} />
-                <Label htmlFor="gguf" className="font-normal">
-                  GGUF のみ
-                </Label>
-              </div>
-              <Button type="submit" disabled={searching}>
-                <SearchIcon /> 検索
-              </Button>
-            </form>
-            {results && (
-              <div className="max-h-80 overflow-auto rounded-lg border">
-                <Table>
-                  <TableBody>
-                    {results.map((r) => (
-                      <TableRow key={r.id} className="cursor-pointer" onClick={() => setRepo(r.id)}>
-                        <TableCell className="font-medium">{r.id}</TableCell>
-                        <TableCell className="text-right text-xs text-muted-foreground tabular-nums">
-                          <DownloadIcon className="mr-1 inline size-3" />
-                          {r.downloads.toLocaleString()}
-                        </TableCell>
-                        <TableCell className="w-16 text-right text-xs text-muted-foreground tabular-nums">
-                          <HeartIcon className="mr-1 inline size-3" />
-                          {r.likes}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                    {results.length === 0 && (
-                      <TableRow>
-                        <TableCell className="text-muted-foreground">見つかりませんでした</TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Ollama pull</CardTitle>
-            <CardDescription>Ollama のレジストリから取得 (Ollama 起動中のみ)</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={pullOllama} className="flex gap-2">
-              <Input placeholder="qwen3:30b-a3b" value={ollamaName} onChange={(e) => setOllamaName(e.target.value)} />
-              <Button type="submit" variant="secondary">
-                Pull
-              </Button>
-            </form>
-          </CardContent>
-        </Card>
-      </div>
+      <Tabs defaultValue="catalog">
+        <TabsList className="w-full sm:w-auto">
+          <TabsTrigger value="catalog">おすすめ・最新</TabsTrigger>
+          <TabsTrigger value="search">検索</TabsTrigger>
+          <TabsTrigger value="ollama">Ollama</TabsTrigger>
+        </TabsList>
+        <TabsContent value="catalog">
+          <CatalogPanel onQueued={refetch} />
+        </TabsContent>
+        <TabsContent value="search">
+          <Card>
+            <CardHeader>
+              <CardTitle>Hugging Face から取得</CardTitle>
+              <CardDescription>キーワード検索、または「owner/repo」を直接入力。複数接続の分割ダウンロード + 再開 + sha256 検証。</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              <form onSubmit={search} className="flex flex-wrap items-center gap-2">
+                <Input className="min-w-40 flex-1" placeholder="例: Qwen3 30B GGUF / unsloth/gpt-oss-20b-GGUF" value={q} onChange={(e) => setQ(e.target.value)} />
+                <div className="flex items-center gap-2">
+                  <Switch id="gguf" checked={ggufOnly} onCheckedChange={setGgufOnly} />
+                  <Label htmlFor="gguf" className="font-normal">
+                    GGUF のみ
+                  </Label>
+                </div>
+                <Button type="submit" disabled={searching}>
+                  <SearchIcon /> 検索
+                </Button>
+              </form>
+              {results && (
+                <div className="max-h-80 overflow-auto rounded-lg border">
+                  <Table>
+                    <TableBody>
+                      {results.map((r) => (
+                        <TableRow key={r.id} className="cursor-pointer" onClick={() => setRepo(r.id)}>
+                          <TableCell className="font-medium">{r.id}</TableCell>
+                          <TableCell className="text-right text-xs text-muted-foreground tabular-nums">
+                            <DownloadIcon className="mr-1 inline size-3" />
+                            {r.downloads.toLocaleString()}
+                          </TableCell>
+                          <TableCell className="w-16 text-right text-xs text-muted-foreground tabular-nums">
+                            <HeartIcon className="mr-1 inline size-3" />
+                            {r.likes}
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                      {results.length === 0 && (
+                        <TableRow>
+                          <TableCell className="text-muted-foreground">見つかりませんでした</TableCell>
+                        </TableRow>
+                      )}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+        <TabsContent value="ollama">
+          <Card>
+            <CardHeader>
+              <CardTitle>Ollama pull</CardTitle>
+              <CardDescription>Ollama のレジストリから取得 (Ollama 起動中のみ)</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <form onSubmit={pullOllama} className="flex gap-2">
+                <Input placeholder="qwen3:30b-a3b" value={ollamaName} onChange={(e) => setOllamaName(e.target.value)} />
+                <Button type="submit" variant="secondary" disabled={pulling || !ollamaName.trim()}>
+                  {pulling && <Loader2Icon className="animate-spin" />} Pull
+                </Button>
+              </form>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
 
       <Card>
         <CardHeader>
@@ -145,21 +174,21 @@ export function DownloadsPage() {
                 </span>
                 <div className="flex gap-1">
                   {(d.status === "downloading" || d.status === "queued" || d.status === "verifying") && (
-                    <Button size="icon-sm" variant="ghost" title="一時停止" onClick={() => act(d.id, "pause")}>
+                    <Button size="icon-sm" variant="ghost" title="一時停止" disabled={busyId === d.id} onClick={() => act(d.id, "pause")}>
                       <PauseIcon />
                     </Button>
                   )}
                   {(d.status === "paused" || d.status === "failed" || d.status === "cancelled") && (
-                    <Button size="icon-sm" variant="ghost" title="再開" onClick={() => act(d.id, "resume")}>
+                    <Button size="icon-sm" variant="ghost" title="再開" disabled={busyId === d.id} onClick={() => act(d.id, "resume")}>
                       <PlayIcon />
                     </Button>
                   )}
                   {d.status !== "completed" && d.status !== "cancelled" && (
-                    <Button size="icon-sm" variant="ghost" title="キャンセル (部分ファイル削除)" onClick={() => act(d.id, "cancel")}>
+                    <Button size="icon-sm" variant="ghost" title="キャンセル (部分ファイル削除)" disabled={busyId === d.id} onClick={() => setCancelTarget(d)}>
                       <XIcon />
                     </Button>
                   )}
-                  <Button size="icon-sm" variant="ghost" title="履歴から削除" onClick={() => act(d.id, "delete")}>
+                  <Button size="icon-sm" variant="ghost" title="履歴から削除" disabled={busyId === d.id} onClick={() => act(d.id, "delete")}>
                     <Trash2Icon />
                   </Button>
                 </div>
@@ -181,6 +210,21 @@ export function DownloadsPage() {
           ))}
         </CardContent>
       </Card>
+
+      <ConfirmDialog
+        open={!!cancelTarget}
+        onOpenChange={(o) => !o && setCancelTarget(null)}
+        title="ダウンロードをキャンセルしますか?"
+        description={cancelTarget?.repo}
+        confirmLabel="キャンセルする"
+        onConfirm={async () => {
+          if (!cancelTarget) return
+          await api(`/downloads/${cancelTarget.id}/cancel`, { method: "POST" })
+          refetch()
+        }}
+      >
+        <p className="text-sm text-muted-foreground">途中までのダウンロード済みファイルは削除されます。</p>
+      </ConfirmDialog>
 
       <RepoFilesDialog repo={repo} onClose={() => setRepo(null)} onQueued={refetch} />
     </div>
