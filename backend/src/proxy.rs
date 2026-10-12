@@ -3,8 +3,9 @@
 //! The target instance is chosen from the request body's `"model"` field (falling back to the
 //! first running instance). Response bodies are streamed through untouched (SSE works), and the
 //! harness credentials (`Authorization`, `Cookie`) never reach the upstream server.
-//! Authentication itself is done by `auth::require_auth` (session cookie, or an `lh_...` API key
-//! as `Authorization: Bearer`), which wraps this router in `main.rs`.
+//! Authentication itself is done by `auth::require_auth` (session cookie, or an API key as
+//! `Authorization: Bearer` / `x-api-key`), which wraps this router in `main.rs`.
+//! `pick_target`, `upstream_model` and `post_json` are shared with the Anthropic translation layer.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -90,7 +91,7 @@ fn target_of(inst: &Instance, models_dir: &std::path::Path) -> Target {
     }
 }
 
-fn targets(state: &AppState) -> Vec<Target> {
+pub(crate) fn targets(state: &AppState) -> Vec<Target> {
     let dir = state.settings.get().models_dir();
     let all: Vec<Arc<Instance>> = state.instances.alive_instances();
     all.iter().map(|i| target_of(i, &dir)).collect()
@@ -191,9 +192,40 @@ fn rewrite_model(body: &[u8], served: &str) -> Option<Bytes> {
     serde_json::to_vec(&v).ok().map(Bytes::from)
 }
 
+/// Running server for a request (same rules as the transparent proxy); `None` when nothing runs.
+pub(crate) fn pick_target(state: &AppState, requested: Option<&str>) -> Option<Target> {
+    let all = targets(state);
+    select_target(&all, requested).map(|i| all[i].clone())
+}
+
+/// Model name to put into the upstream request body (vLLM only knows its absolute path).
+pub(crate) fn upstream_model(target: &Target, requested: &str) -> String {
+    if target.runtime == "vllm" && !target.served.is_empty() {
+        target.served.clone()
+    } else {
+        requested.to_owned()
+    }
+}
+
+/// How a failed connection to the upstream is reported: (status, machine code, message).
+fn send_error_parts(e: &reqwest::Error, target: &Target) -> (StatusCode, &'static str, String) {
+    tracing::warn!("proxy to {} failed: {e}", target.base);
+    let (status, code) = if e.is_connect() || e.is_timeout() { (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable") } else { (StatusCode::BAD_GATEWAY, "upstream_error") };
+    (status, code, format!("Model server is not reachable: {}", target.name))
+}
+
+/// POST a JSON body to `path` (e.g. `/v1/chat/completions`) of `target`. The response is returned
+/// unread, so the caller can stream it. Errors are `(status, code, message)`.
+pub(crate) async fn post_json(target: &Target, path: &str, body: &Value) -> Result<reqwest::Response, (StatusCode, &'static str, String)> {
+    CLIENT.post(format!("{}{}", target.base, path)).json(body).send().await.map_err(|e| send_error_parts(&e, target))
+}
+
 // ------------------------------------------------------------------ handlers
 async fn list_models(State(state): State<AppState>, req: Request) -> Response {
     let found: Vec<Target> = targets(&state).into_iter().filter(|t| t.runtime != "ollama" && !t.model.is_empty()).collect();
+    if req.headers().contains_key("anthropic-version") {
+        return crate::anthropic::models_response(&found);
+    }
     if found.is_empty() {
         // Nothing of ours is running: let an ollama server (if any) answer, else 503.
         return forward(State(state), req).await;
@@ -247,9 +279,8 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     let upstream = match rb.send().await {
         Ok(r) => r,
         Err(e) => {
-            let (status, code) = if e.is_connect() || e.is_timeout() { (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable") } else { (StatusCode::BAD_GATEWAY, "upstream_error") };
-            tracing::warn!("proxy to {} failed: {e}", target.base);
-            return oai_error(status, format!("Model server is not reachable: {}", target.name), "server_error", code);
+            let (status, code, msg) = send_error_parts(&e, target);
+            return oai_error(status, msg, "server_error", code);
         }
     };
 

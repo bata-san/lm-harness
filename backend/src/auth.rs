@@ -7,7 +7,10 @@
 //!   stored as SHA-256 hashes; the password as an argon2id PHC string.
 //! * Sessions: opaque random cookie `harness_session` (HttpOnly, SameSite=Strict), 7 day sliding
 //!   idle expiry, 30 day absolute expiry.
-//! * API keys: `Authorization: Bearer lh_...` for scripts / OpenAI-compatible clients.
+//! * API keys: `sk-lh-...` (OpenAI style), `sk-ant-lh-...` (Anthropic style) or legacy `lh_...`,
+//!   accepted as `Authorization: Bearer <key>` or `x-api-key: <key>`. A key may ONLY call `/v1/*`
+//!   (every other route is session-only; `/api/health` is public anyway). Failed key attempts are
+//!   rate limited per IP like failed logins.
 //! * CSRF: cookie-authenticated unsafe requests must carry `X-Harness-CSRF: 1`.
 //! * Local setup: first-run account creation is only possible from the workstation itself
 //!   (loopback peer, no proxy headers, loopback Host).
@@ -68,6 +71,32 @@ const RATE_MAX_GLOBAL: usize = 30;
 const RELOAD_INTERVAL: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(1) };
 const TOKEN_LEN: usize = 43; // base64url(32 bytes)
 const API_KEY_PREFIX: &str = "lh_";
+const OPENAI_KEY_PREFIX: &str = "sk-lh-";
+const ANTHROPIC_KEY_PREFIX: &str = "sk-ant-lh-";
+
+/// Key prefix of a kind ("openai" | "anthropic" | "generic").
+fn key_prefix_of(kind: &str) -> Option<&'static str> {
+    match kind {
+        "openai" => Some(OPENAI_KEY_PREFIX),
+        "anthropic" => Some(ANTHROPIC_KEY_PREFIX),
+        "generic" => Some(API_KEY_PREFIX),
+        _ => None,
+    }
+}
+
+/// Generate a fresh key of `kind` (full secret; show it once).
+fn generate_key(kind: &str) -> Option<String> {
+    Some(format!("{}{}", key_prefix_of(kind)?, random_token()))
+}
+
+/// Shape check: right prefix and length for one of the three kinds.
+fn key_has_valid_shape(key: &str) -> bool {
+    [OPENAI_KEY_PREFIX, ANTHROPIC_KEY_PREFIX, API_KEY_PREFIX].iter().any(|p| key.strip_prefix(p).is_some_and(|rest| rest.len() == TOKEN_LEN))
+}
+
+fn default_key_kind() -> String {
+    "generic".into()
+}
 
 const MSG_UNCONFIGURED: &str = "認証が未設定です。ワークステーション上で初期設定してください";
 const MSG_LOGIN_REQUIRED: &str = "ログインが必要です";
@@ -109,6 +138,9 @@ struct ApiKeyRec {
     id: String,
     name: String,
     prefix: String,
+    /// "openai" | "anthropic" | "generic" (keys written before kinds existed are generic).
+    #[serde(default = "default_key_kind")]
+    kind: String,
     /// sha256 hex of the full key.
     hash: String,
     created_at: i64,
@@ -170,6 +202,8 @@ pub struct AuthManager {
     path: PathBuf,
     inner: RwLock<Inner>,
     limiter: Mutex<Limiter>,
+    /// Failed API-key attempts (separate from logins so key spam cannot lock out the admin).
+    key_limiter: Mutex<Limiter>,
     last_reload_check: Mutex<Instant>,
 }
 
@@ -260,6 +294,7 @@ impl AuthManager {
             path,
             inner: RwLock::new(inner),
             limiter: Mutex::new(Limiter::default()),
+            key_limiter: Mutex::new(Limiter::default()),
             last_reload_check: Mutex::new(Instant::now()),
         })
     }
@@ -418,7 +453,7 @@ impl AuthManager {
     // --- API keys ---------------------------------------------------------------------------
 
     fn api_key_principal(&self, key: &str, now: i64) -> Option<Principal> {
-        if !key.starts_with(API_KEY_PREFIX) || key.len() != API_KEY_PREFIX.len() + TOKEN_LEN {
+        if !key_has_valid_shape(key) {
             return None;
         }
         let hash = sha256_hex(key.as_bytes());
@@ -490,6 +525,16 @@ impl AuthManager {
     }
     fn rate_fail(&self, ip: IpAddr) {
         self.limiter.lock().fail(ip_key(ip), Instant::now());
+    }
+    /// Record a failed key attempt; `Err(429)` once the IP (or everyone) is over the limit.
+    fn key_fail(&self, ip: IpAddr) -> Result<(), ApiError> {
+        let mut l = self.key_limiter.lock();
+        let now = Instant::now();
+        if let Some(mins) = l.check(ip_key(ip), now) {
+            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, format!("API キーの認証失敗が多すぎます。{mins} 分後に再試行してください")));
+        }
+        l.fail(ip_key(ip), now);
+        Ok(())
     }
     fn rate_reset(&self, ip: IpAddr) {
         self.limiter.lock().reset(ip_key(ip));
@@ -857,6 +902,21 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim().to_owned())
 }
 
+/// Every API-key credential presented: `Authorization: Bearer` and `x-api-key`.
+fn key_candidates(headers: &HeaderMap) -> Vec<String> {
+    let mut out = Vec::new();
+    out.extend(bearer_token(headers));
+    if let Some(v) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        out.push(v.trim().to_owned());
+    }
+    out.retain(|k| !k.is_empty());
+    out
+}
+
+fn is_v1_path(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/")
+}
+
 fn is_public(method: &Method, path: &str) -> bool {
     match path {
         "/api/auth/login" | "/api/auth/setup" => method == Method::POST,
@@ -908,9 +968,19 @@ pub fn authorize(
                     return Ok(Some(p));
                 }
             }
-            if let Some(key) = bearer_token(headers) {
-                if let Some(p) = mgr.api_key_principal(&key, now) {
-                    return Ok(Some(p));
+            if !public {
+                let candidates = key_candidates(headers);
+                for key in &candidates {
+                    if let Some(p) = mgr.api_key_principal(key, now) {
+                        // API keys are for the model API only; all admin routes are session-only.
+                        if is_v1_path(uri.path()) {
+                            return Ok(Some(p));
+                        }
+                        return deny(StatusCode::FORBIDDEN, "API キーでは /v1 以外にアクセスできません");
+                    }
+                }
+                if !candidates.is_empty() {
+                    mgr.key_fail(client_ip(peer, headers))?;
                 }
             }
             if public {
@@ -924,6 +994,8 @@ pub fn authorize(
 
 /// Middleware body shared by `require_auth` and the tests.
 pub async fn guard(mgr: &AuthManager, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_owned();
+    let headers = req.headers().clone();
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     match authorize(mgr, peer, req.method(), req.uri(), req.headers()) {
         Ok(principal) => {
@@ -932,8 +1004,31 @@ pub async fn guard(mgr: &AuthManager, mut req: Request, next: Next) -> Response 
             }
             next.run(req).await
         }
-        Err(e) => e.into_response(),
+        Err(e) => {
+            if is_v1_path(&path) {
+                v1_error(e, &path, &headers)
+            } else {
+                e.into_response()
+            }
+        }
     }
+}
+
+/// `/v1/*` clients expect their own error envelope, not the admin `{"detail": ...}` one.
+fn v1_error(e: ApiError, path: &str, headers: &HeaderMap) -> Response {
+    let anthropic = path.starts_with("/v1/messages") || headers.contains_key("anthropic-version");
+    let (atype, otype) = match e.0 {
+        StatusCode::UNAUTHORIZED => ("authentication_error", "invalid_request_error"),
+        StatusCode::FORBIDDEN => ("permission_error", "invalid_request_error"),
+        StatusCode::TOO_MANY_REQUESTS => ("rate_limit_error", "rate_limit_error"),
+        _ => ("api_error", "server_error"),
+    };
+    let body = if anthropic {
+        json!({"type": "error", "error": {"type": atype, "message": e.1}})
+    } else {
+        json!({"error": {"message": e.1, "type": otype, "param": null, "code": atype}})
+    };
+    (e.0, Json(body)).into_response()
 }
 
 /// Axum middleware guarding every `/api/*` and `/v1/*` route (see module docs for rules).
@@ -1376,6 +1471,9 @@ async fn delete_session(State(mgr): State<Arc<AuthManager>>, client: Client, use
 #[derive(Deserialize)]
 struct KeyReq {
     name: String,
+    /// "openai" (default) | "anthropic" | "generic"
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 async fn create_key(State(mgr): State<Arc<AuthManager>>, _user: SessionUser, ApiJson(req): ApiJson<KeyReq>) -> Result<Response, ApiError> {
@@ -1383,16 +1481,23 @@ async fn create_key(State(mgr): State<Arc<AuthManager>>, _user: SessionUser, Api
     if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
         return Err(ApiError::bad_request("キー名は 1〜64 文字で指定してください"));
     }
-    let key = format!("{API_KEY_PREFIX}{}", random_token());
+    let kind = req.kind.as_deref().unwrap_or("openai").to_owned();
+    let Some(key) = generate_key(&kind) else {
+        return Err(ApiError::bad_request("kind は openai / anthropic / generic のいずれかです"));
+    };
+    let prefix_len = if kind == "generic" { 8 } else { key_prefix_of(&kind).map_or(8, str::len) + 4 };
     let rec = ApiKeyRec {
         id: random_hex(8),
         name: name.clone(),
-        prefix: key.chars().take(8).collect(),
+        kind: kind.clone(),
+        prefix: key.chars().take(prefix_len).collect(),
         hash: sha256_hex(key.as_bytes()),
         created_at: now_unix(),
         last_used_at: None,
     };
     let id = rec.id.clone();
+    let prefix = rec.prefix.clone();
+    let created_at = ts(rec.created_at);
     mgr.mutate(|f| {
         if f.api_keys.len() >= MAX_API_KEYS {
             return Err(ApiError::bad_request("API キーの上限に達しました"));
@@ -1400,7 +1505,7 @@ async fn create_key(State(mgr): State<Arc<AuthManager>>, _user: SessionUser, Api
         f.api_keys.push(rec);
         Ok(())
     })??;
-    Ok(Json(json!({"id": id, "name": name, "key": key})).into_response())
+    Ok(Json(json!({"id": id, "name": name, "kind": kind, "key": key, "prefix": prefix, "created_at": created_at})).into_response())
 }
 
 async fn list_keys(State(mgr): State<Arc<AuthManager>>, _user: SessionUser) -> Json<serde_json::Value> {
@@ -1412,8 +1517,10 @@ async fn list_keys(State(mgr): State<Arc<AuthManager>>, _user: SessionUser) -> J
                     json!({
                         "id": k.id,
                         "name": k.name,
+                        "kind": k.kind,
                         "prefix": k.prefix,
                         "created_at": ts(k.created_at),
+                        "last_used": k.last_used_at.map(ts),
                         "last_used_at": k.last_used_at.map(ts),
                     })
                 })
@@ -1470,6 +1577,10 @@ mod tests {
         let mgr = AuthManager::load_from(path.clone());
         let app = Router::new()
             .route("/api/protected", get(|| async { "secret" }).post(|| async { "posted" }))
+            .route("/v1/ping", get(|| async { "pong" }).post(|| async { "pong" }))
+            .route("/v1/messages", post(|| async { "msg" }))
+            .route("/api/system", get(|| async { "system" }))
+            .route("/api/tunnel/start", post(|| async { "tunnel" }))
             .merge(routes::<Arc<AuthManager>>())
             .route_layer(from_fn_with_state(mgr.clone(), |State(m): State<Arc<AuthManager>>, req: Request, next: Next| async move {
                 guard(&m, req, next).await
@@ -1807,56 +1918,141 @@ mod tests {
         assert_eq!(r.body["configured"], true);
     }
 
+    #[test]
+    fn key_kinds_generate_and_validate() {
+        let o = generate_key("openai").unwrap();
+        let a = generate_key("anthropic").unwrap();
+        let g = generate_key("generic").unwrap();
+        assert!(o.starts_with("sk-lh-") && o.len() == 6 + TOKEN_LEN);
+        assert!(a.starts_with("sk-ant-lh-") && a.len() == 10 + TOKEN_LEN);
+        assert!(g.starts_with("lh_") && g.len() == 3 + TOKEN_LEN);
+        assert!(generate_key("bogus").is_none());
+        assert_ne!(generate_key("openai"), Some(o.clone()));
+        for k in [&o, &a, &g] {
+            assert!(key_has_valid_shape(k));
+        }
+        assert!(!key_has_valid_shape("sk-lh-short") && !key_has_valid_shape("sk-ant-lh-") && !key_has_valid_shape(&format!("sk-{}", "a".repeat(TOKEN_LEN))));
+    }
+
     #[tokio::test]
-    async fn bearer_api_keys() {
+    async fn api_keys_kinds_and_header_styles() {
         let h = spawn().await;
         let cookie = h.setup().await;
         let auth = [("cookie", cookie.as_str()), ("x-harness-csrf", "1")];
-        let r = h.call("POST", "/api/auth/keys", &auth, Some(json!({"name": "script"}))).await;
+        let mut keys = Vec::new();
+        for (kind, prefix) in [(None, "sk-lh-"), (Some("openai"), "sk-lh-"), (Some("anthropic"), "sk-ant-lh-"), (Some("generic"), "lh_")] {
+            let body = match kind {
+                Some(k) => json!({"name": "k", "kind": k}),
+                None => json!({"name": "k"}),
+            };
+            let r = h.call("POST", "/api/auth/keys", &auth, Some(body)).await;
+            assert_eq!(r.status, 200, "{:?}", r.body);
+            let key = r.body["key"].as_str().unwrap().to_owned();
+            assert!(key.starts_with(prefix));
+            assert_eq!(r.body["kind"], kind.unwrap_or("openai"));
+            assert!(key.starts_with(r.body["prefix"].as_str().unwrap()));
+            assert!(r.body["created_at"].is_string() && r.body["id"].is_string());
+            // only hashes are stored
+            let stored = std::fs::read_to_string(&h.path).unwrap();
+            assert!(!stored.contains(&key) && stored.contains(&sha256_hex(key.as_bytes())));
+            keys.push(key);
+        }
+        let r = h.call("POST", "/api/auth/keys", &auth, Some(json!({"name": "k", "kind": "bogus"}))).await;
+        assert_eq!(r.status, 400);
+
+        for key in &keys {
+            // Bearer and x-api-key both work on /v1, without CSRF header, for any method
+            let bearer = format!("Bearer {key}");
+            assert_eq!(h.call("POST", "/v1/ping", &[("authorization", &bearer)], None).await.status, 200);
+            assert_eq!(h.call("POST", "/v1/messages", &[("x-api-key", key.as_str()), ("anthropic-version", "2023-06-01")], None).await.status, 200);
+            assert_eq!(h.call("GET", "/v1/ping", &[("x-api-key", key.as_str())], None).await.status, 200);
+        }
+        let r = h.call("GET", "/api/auth/keys", &auth, None).await;
+        let rows = r.body.as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["openai", "openai", "anthropic", "generic"]);
+        assert!(rows.iter().all(|r| r["last_used"].is_string() && r.get("key").is_none() && r.get("hash").is_none() && r["prefix"].is_string()));
+    }
+
+    #[tokio::test]
+    async fn legacy_keys_without_kind_still_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let h = spawn_with(dir, path.clone()).await;
+        let cookie = h.setup().await;
+        let key = format!("lh_{}", random_token());
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["api_keys"] = json!([{"id": "old1", "name": "legacy", "prefix": &key[..8], "hash": sha256_hex(key.as_bytes()), "created_at": 1700000000}]);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        let r = h.call("GET", "/v1/ping", &[("authorization", &format!("Bearer {key}"))], None).await;
         assert_eq!(r.status, 200);
+        let r = h.call("GET", "/api/auth/keys", &[("cookie", cookie.as_str())], None).await;
+        assert_eq!(r.body[0]["kind"], "generic");
+    }
+
+    #[tokio::test]
+    async fn api_keys_only_reach_v1() {
+        let h = spawn().await;
+        let cookie = h.setup().await;
+        let auth = [("cookie", cookie.as_str()), ("x-harness-csrf", "1")];
+        let r = h.call("POST", "/api/auth/keys", &auth, Some(json!({"name": "script", "kind": "anthropic"}))).await;
         let key = r.body["key"].as_str().unwrap().to_owned();
         let id = r.body["id"].as_str().unwrap().to_owned();
-        assert!(key.starts_with("lh_") && key.len() == 3 + TOKEN_LEN);
-        assert_eq!(r.body["name"], "script");
-
-        // the key is never stored in clear
-        let stored = std::fs::read_to_string(&h.path).unwrap();
-        assert!(!stored.contains(&key));
-        assert!(stored.contains(&sha256_hex(key.as_bytes())));
-
         let bearer = format!("Bearer {key}");
-        // no CSRF header needed for bearer
-        let r = h.call("POST", "/api/protected", &[("authorization", &bearer)], None).await;
-        assert_eq!(r.status, 200);
-        let r = h.call("GET", "/api/protected", &[("authorization", "Bearer lh_nope")], None).await;
-        assert_eq!(r.status, 401);
-        let wrong = format!("Bearer lh_{}", "B".repeat(TOKEN_LEN));
-        let r = h.call("GET", "/api/protected", &[("authorization", &wrong)], None).await;
-        assert_eq!(r.status, 401);
-        // API keys cannot manage credentials
-        let r = h.call("POST", "/api/auth/keys", &[("authorization", &bearer)], Some(json!({"name": "evil"}))).await;
-        assert_eq!(r.status, 403);
-        let r = h.call("POST", "/api/auth/password", &[("authorization", &bearer)], Some(json!({"current": PW, "new": "another long password"}))).await;
-        assert_eq!(r.status, 403);
-        // status shows api_key principal
+        for hdr in [("authorization", bearer.as_str()), ("x-api-key", key.as_str())] {
+            for (m, p) in [
+                ("GET", "/api/system"),
+                ("POST", "/api/tunnel/start"),
+                ("GET", "/api/protected"),
+                ("GET", "/api/auth/keys"),
+                ("POST", "/api/auth/keys"),
+                ("DELETE", "/api/auth/keys/x"),
+                ("POST", "/api/auth/password"),
+                ("GET", "/api/auth/sessions"),
+            ] {
+                let r = h.call(m, p, &[hdr], Some(json!({"name": "evil"}))).await;
+                assert_eq!(r.status, 403, "{m} {p}");
+            }
+        }
+        // the session still reaches them
+        assert_eq!(h.call("GET", "/api/system", &auth, None).await.status, 200);
+        // status is public: a key is simply not a login there
         let r = h.call("GET", "/api/auth/status", &[("authorization", &bearer)], None).await;
-        assert_eq!(r.body["principal_kind"], "api_key");
+        assert_eq!(r.body["authenticated"], false);
 
-        // list: no secret, last_used_at set
-        let r = h.call("GET", "/api/auth/keys", &auth, None).await;
-        let row = &r.body[0];
-        assert_eq!(row["id"], id.as_str());
-        assert_eq!(row["prefix"], &key[..8]);
-        assert!(row.get("key").is_none() && row.get("hash").is_none());
-        assert!(row["last_used_at"].is_string());
+        // wrong keys: 401 in the error shape of the API; Anthropic shape for /v1/messages
+        let wrong = format!("sk-ant-lh-{}", "B".repeat(TOKEN_LEN));
+        let r = h.call("GET", "/v1/ping", &[("x-api-key", &wrong)], None).await;
+        assert_eq!(r.status, 401);
+        assert_eq!(r.body["error"]["code"], "authentication_error");
+        let r = h.call("POST", "/v1/messages", &[("x-api-key", &wrong), ("anthropic-version", "2023-06-01")], None).await;
+        assert_eq!(r.status, 401);
+        assert_eq!(r.body["type"], "error");
+        assert_eq!(r.body["error"]["type"], "authentication_error");
+        assert_eq!(h.call("GET", "/v1/ping", &[], None).await.status, 401);
 
         // revoke
-        let r = h.call("DELETE", &format!("/api/auth/keys/{id}"), &auth, None).await;
-        assert_eq!(r.status, 200);
-        let r = h.call("GET", "/api/protected", &[("authorization", &bearer)], None).await;
+        assert_eq!(h.call("DELETE", &format!("/api/auth/keys/{id}"), &auth, None).await.status, 200);
+        assert_eq!(h.call("GET", "/v1/ping", &[("x-api-key", &key)], None).await.status, 401);
+        assert_eq!(h.call("DELETE", &format!("/api/auth/keys/{id}"), &auth, None).await.status, 404);
+    }
+
+    #[tokio::test]
+    async fn failed_key_attempts_are_rate_limited() {
+        let h = spawn().await;
+        h.setup().await;
+        let wrong = format!("sk-lh-{}", "C".repeat(TOKEN_LEN));
+        for _ in 0..RATE_MAX_PER_IP {
+            assert_eq!(h.call("GET", "/v1/ping", &[("x-api-key", &wrong)], None).await.status, 401);
+        }
+        let r = h.call("GET", "/v1/ping", &[("x-api-key", &wrong)], None).await;
+        assert_eq!(r.status, 429);
+        // login attempts use their own budget
+        assert_eq!(h.login(&[], PW, None).await.status, 200);
+        // another IP is unaffected
+        let r = h.call("GET", "/v1/ping", &[("x-api-key", &wrong), ("x-test-peer", "198.51.100.7:1")], None).await;
         assert_eq!(r.status, 401);
-        let r = h.call("DELETE", &format!("/api/auth/keys/{id}"), &auth, None).await;
-        assert_eq!(r.status, 404);
     }
 
     #[tokio::test]

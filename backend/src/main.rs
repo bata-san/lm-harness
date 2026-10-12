@@ -1,4 +1,5 @@
 mod affinity;
+mod anthropic;
 mod auth;
 mod catalog;
 mod config;
@@ -135,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(tunnel::router())
         .merge(catalog::router())
         .merge(proxy::router())
+        .merge(anthropic::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
