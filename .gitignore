@@ -10,3 +10,6 @@ __pycache__/
 # rust
 backend/target/
 .claude/
+
+apps/opendots/data/
+apps/opendots/.env
