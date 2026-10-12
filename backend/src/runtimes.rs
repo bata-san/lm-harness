@@ -341,12 +341,13 @@ pub struct JobDef {
     pub sudo: bool,
 }
 
-pub const JOBS: [JobDef; 5] = [
+pub const JOBS: [JobDef; 6] = [
     JobDef { id: "setup", title: "WSL 基本セットアップ (apt / CUDA Toolkit / uv)", script: "wsl/setup.sh", sudo: true },
     JobDef { id: "build-llama-cpp", title: "llama.cpp を CUDA でビルド / 更新", script: "wsl/build-llama-cpp.sh", sudo: false },
     JobDef { id: "install-vllm", title: "vLLM を専用 venv にインストール / 更新", script: "wsl/install-vllm.sh", sudo: false },
     JobDef { id: "install-strata", title: "Strata を取得 / 更新 (git clone + venv)", script: "wsl/install-strata.sh", sudo: false },
     JobDef { id: "install-ollama", title: "Ollama をインストール / 更新", script: "wsl/install-ollama.sh", sudo: true },
+    JobDef { id: "update-harness", title: "ハーネス本体を更新 (git pull --ff-only → ./harness.sh install)", script: "wsl/update-harness.sh", sudo: false },
 ];
 
 pub fn job(id: &str) -> Option<&'static JobDef> {

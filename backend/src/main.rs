@@ -1,7 +1,9 @@
+mod admin;
 mod affinity;
 mod anthropic;
 mod auth;
 mod catalog;
+mod chat;
 mod config;
 mod downloads;
 mod error;
@@ -32,6 +34,7 @@ use clap::{Parser, Subcommand};
 use rust_embed::RustEmbed;
 use tokio::sync::watch;
 use tower_http::compression::CompressionLayer;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::SettingsStore;
@@ -94,8 +97,11 @@ struct Frontend;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))
+    // fmt output plus an in-memory ring buffer (last 2000 lines) served by /api/admin/logs?source=harness
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))
+        .with(tracing_subscriber::fmt::layer())
+        .with(admin::ring_layer())
         .init();
     let cli = Cli::parse();
     if let Some(cmd) = cli.command {
@@ -137,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(catalog::router())
         .merge(proxy::router())
         .merge(anthropic::router())
+        .merge(chat::router())
+        .merge(admin::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
@@ -160,6 +168,10 @@ async fn main() -> anyhow::Result<()> {
     state.tunnel.stop().await;
     state.instances.stop_all().await;
     state.downloads.persist();
+    if admin::restart_requested() {
+        // non-zero exit so systemd (Restart=always / on-failure) revives the unit
+        std::process::exit(admin::RESTART_EXIT_CODE);
+    }
     Ok(())
 }
 
