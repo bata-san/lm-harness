@@ -16,6 +16,7 @@ const FIELDS: { key: keyof Settings; label: string; hint?: string; type?: "numbe
   { key: "connections_per_file", label: "1 ファイルあたりの接続数", hint: "回線が太いなら 8〜16", type: "number" },
   { key: "llama_cpp_dir", label: "llama.cpp ディレクトリ" },
   { key: "vllm_venv", label: "vLLM venv" },
+  { key: "strata_dir", label: "Strata ディレクトリ" },
   { key: "ollama_url", label: "Ollama URL" },
   { key: "default_host", label: "サーバの bind アドレス", hint: "0.0.0.0 で LAN からも接続可。ローカル限定なら 127.0.0.1" },
   { key: "port_range_start", label: "ポート自動割当の開始番号", type: "number" },

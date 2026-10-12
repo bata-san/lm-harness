@@ -1,6 +1,6 @@
 # LLM Harness
 
-ローカル LLM ランタイム (**llama.cpp / vLLM / Ollama**) を 1 つの Web UI から管理する統合ハーネス。
+ローカル LLM ランタイム (**llama.cpp / vLLM / Ollama / [Strata](https://github.com/Niko1221/Strata)**) を 1 つの Web UI から管理する統合ハーネス。
 Windows + **WSL2** 上で NVIDIA GPU と多コア CPU を使い切ることを目標にしています
 (想定環境: Lenovo ThinkStation P620 / Threadripper PRO 5000WX / RTX A5000)。
 
@@ -54,6 +54,13 @@ Windows + **WSL2** 上で NVIDIA GPU と多コア CPU を使い切ることを�
 
 - **vLLM**: 既定で `--gpu-memory-utilization 0.92 --max-model-len 32768 --enable-prefix-caching`。
 - **Ollama**: `OLLAMA_FLASH_ATTENTION=1`、`OLLAMA_KV_CACHE_TYPE=q8_0`、`OLLAMA_HOST=127.0.0.1:11434` を systemd に設定済み。
+
+## Strata (大型 MoE 専用エンジン)
+
+[Strata](https://github.com/Niko1221/Strata) (MIT) は llama.cpp/ggml の一部を使う、Qwen3.8-Flash-Next 向けの推論エンジンです (頻出 expert を VRAM、残りを RAM に置く)。
+「ランタイム」画面の **Strata** から取得 (`git clone` + venv) し、表示された手順どおり `cd ~/.llm-harness/strata && ./setup.sh` を一度だけ実行してモデル (~70 GB) を導入してください。
+`strata-<model>.json` が作られると、「サーバを起動」でランタイムに Strata を選べます。モード (FULL/SHARED) の CPU affinity / nice は他のランタイムと同様に適用され、
+メトリクスは `/metrics/prometheus` から取得します。Strata は 12 GB 以上の VRAM と 32 GB 以上の RAM を要求します。
 
 ## モード切替 (FULL / SHARED)
 

@@ -39,6 +39,27 @@ pub fn vllm_bin(s: &Settings) -> Option<PathBuf> {
     }
 }
 
+/// Strata is a Python server (`serve/server.py`) living in its own checkout with a private venv.
+pub fn strata_python(s: &Settings) -> Option<PathBuf> {
+    let d = s.strata_dir();
+    let py = d.join(".venv/bin/python");
+    (py.is_file() && d.join("serve/server.py").is_file()).then_some(py)
+}
+
+/// A strata run config id: a plain `strata-<model>.json` file name, never a path.
+pub fn valid_strata_config(id: &str) -> bool {
+    id.starts_with("strata-") && id.ends_with(".json") && !id.contains(['/', '\\']) && !id.contains("..") && id.len() <= 120
+}
+
+/// Run configs the setup wizard wrote into the Strata checkout.
+pub fn strata_configs(s: &Settings) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(s.strata_dir())
+        .map(|rd| rd.flatten().filter_map(|e| e.file_name().into_string().ok()).filter(|n| valid_strata_config(n)).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
 pub fn ollama_bin() -> Option<PathBuf> {
     which("ollama")
 }
@@ -136,6 +157,7 @@ pub async fn status(s: &Settings) -> Vec<RuntimeStatus> {
     let llama = llama_server_bin(s);
     let vllm = vllm_bin(s);
     let ollama = ollama_bin();
+    let strata = strata_python(s);
 
     let key = format!("{}|{}", llama.as_deref().map_or(String::new(), |p| p.display().to_string()), vllm.as_deref().map_or(String::new(), |p| p.display().to_string()));
     let (llama_ver, vllm_ver) = {
@@ -185,6 +207,15 @@ pub async fn status(s: &Settings) -> Vec<RuntimeStatus> {
             description: "safetensors / AWQ / GPTQ 向けの高スループットサーバ。並列リクエストに強い。",
         },
         RuntimeStatus {
+            id: "strata",
+            installed: strata.is_some(),
+            path: strata.map(|_| s.strata_dir().display().to_string()),
+            version: None,
+            running: None,
+            install_job: "install-strata",
+            description: "Strata: 大型 MoE (Qwen3.8-Flash-Next 等) を VRAM 12GB 級で動かす専用エンジン。インストール後に ./setup.sh でモデルを導入。",
+        },
+        RuntimeStatus {
             id: "ollama",
             installed: ollama.is_some(),
             path: ollama.map(|p| p.display().to_string()),
@@ -219,6 +250,21 @@ pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, arg
             cmd.extend(args.iter().cloned());
             Ok((cmd, env))
         }
+        "strata" => {
+            let Some(py) = strata_python(s) else {
+                anyhow::bail!("Strata が見つかりません。Runtimes からインストールし、strata ディレクトリで ./setup.sh を実行してください");
+            };
+            if !valid_strata_config(model_path_name(model_path)) {
+                anyhow::bail!("Strata のモデルは strata-<name>.json の設定ファイルを指定してください");
+            }
+            let cfg = s.strata_dir().join(model_path_name(model_path));
+            if !cfg.is_file() {
+                anyhow::bail!("設定ファイル {} がありません。strata ディレクトリで ./setup.sh を実行してください", cfg.display());
+            }
+            let mut cmd = vec![exe(py), "-m".into(), "serve.server".into(), "--engine".into(), "strata".into(), "--config".into(), cfg.display().to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
+            cmd.extend(args.iter().cloned());
+            Ok((cmd, env))
+        }
         "ollama" => {
             let Some(bin) = ollama_bin() else {
                 anyhow::bail!("ollama が見つかりません");
@@ -238,6 +284,15 @@ pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, arg
         }
         other => anyhow::bail!("unknown runtime {other}"),
     }
+}
+
+fn model_path_name(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
+/// Prometheus endpoint of a runtime (Strata serves JSON on /metrics, vLLM-named Prometheus text on /metrics/prometheus).
+pub fn metrics_path(runtime: &str) -> &'static str {
+    if runtime == "strata" { "/metrics/prometheus" } else { "/metrics" }
 }
 
 pub fn health_path(runtime: &str) -> &'static str {
@@ -286,10 +341,11 @@ pub struct JobDef {
     pub sudo: bool,
 }
 
-pub const JOBS: [JobDef; 4] = [
+pub const JOBS: [JobDef; 5] = [
     JobDef { id: "setup", title: "WSL 基本セットアップ (apt / CUDA Toolkit / uv)", script: "wsl/setup.sh", sudo: true },
     JobDef { id: "build-llama-cpp", title: "llama.cpp を CUDA でビルド / 更新", script: "wsl/build-llama-cpp.sh", sudo: false },
     JobDef { id: "install-vllm", title: "vLLM を専用 venv にインストール / 更新", script: "wsl/install-vllm.sh", sudo: false },
+    JobDef { id: "install-strata", title: "Strata を取得 / 更新 (git clone + venv)", script: "wsl/install-strata.sh", sudo: false },
     JobDef { id: "install-ollama", title: "Ollama をインストール / 更新", script: "wsl/install-ollama.sh", sudo: true },
 ];
 
@@ -303,6 +359,7 @@ pub fn job_command(job_id: &str, s: &Settings) -> anyhow::Result<(Vec<String>, B
     let env = BTreeMap::from([
         ("LLAMA_CPP_DIR".to_string(), s.llama_cpp_dir().display().to_string()),
         ("VLLM_VENV".to_string(), s.vllm_venv().display().to_string()),
+        ("STRATA_DIR".to_string(), s.strata_dir().display().to_string()),
         ("PATH".to_string(), format!("{}:/usr/local/cuda/bin", std::env::var("PATH").unwrap_or_default())),
     ]);
     Ok((vec!["bash".into(), scripts_dir().join(j.script).display().to_string()], env))
@@ -311,6 +368,33 @@ pub fn job_command(job_id: &str, s: &Settings) -> anyhow::Result<(Vec<String>, B
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strata_config_ids_are_plain_file_names() {
+        assert!(valid_strata_config("strata-Q2_0.json"));
+        for bad in ["../strata-x.json", "strata-/x.json", "strata-..json/x", "model.json", "strata-x.txt", "/etc/strata-x.json", "strata-a\\b.json"] {
+            assert!(!valid_strata_config(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn strata_command_uses_private_venv_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings { strata_dir: dir.path().display().to_string(), ..Default::default() };
+        assert!(build_command("strata", "strata-a.json", "127.0.0.1", 8090, &[], &s).is_err(), "not installed");
+        std::fs::create_dir_all(dir.path().join(".venv/bin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("serve")).unwrap();
+        std::fs::write(dir.path().join(".venv/bin/python"), "").unwrap();
+        std::fs::write(dir.path().join("serve/server.py"), "").unwrap();
+        assert!(build_command("strata", "strata-a.json", "127.0.0.1", 8090, &[], &s).is_err(), "config missing");
+        std::fs::write(dir.path().join("strata-a.json"), "{}").unwrap();
+        let (cmd, _) = build_command("strata", "strata-a.json", "127.0.0.1", 8090, &["--lazy".into()], &s).unwrap();
+        assert!(cmd[0].ends_with(".venv/bin/python"));
+        assert_eq!(&cmd[1..5], ["-m", "serve.server", "--engine", "strata"]);
+        assert!(cmd.contains(&"--lazy".to_string()) && cmd.contains(&"8090".to_string()));
+        assert_eq!(strata_configs(&s), vec!["strata-a.json".to_string()]);
+        assert_eq!(metrics_path("strata"), "/metrics/prometheus");
+    }
 
     #[test]
     fn metrics_sum_labelled_series() {

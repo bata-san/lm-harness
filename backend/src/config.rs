@@ -45,6 +45,8 @@ pub struct Settings {
     /// llama.cpp checkout built by scripts/wsl/build-llama-cpp.sh
     pub llama_cpp_dir: String,
     pub vllm_venv: String,
+    /// Strata checkout (git clone + its own .venv); model configs are `strata-<model>.json` inside.
+    pub strata_dir: String,
     pub ollama_url: String,
     /// Used in full mode; shared mode uses `mode.shared.*`.
     pub max_concurrent_downloads: usize,
@@ -65,6 +67,7 @@ impl Default for Settings {
             hf_endpoint: "https://huggingface.co".into(),
             llama_cpp_dir: HARNESS_HOME.join("llama.cpp").to_string_lossy().into(),
             vllm_venv: HARNESS_HOME.join("venvs/vllm").to_string_lossy().into(),
+            strata_dir: HARNESS_HOME.join("strata").to_string_lossy().into(),
             ollama_url: "http://127.0.0.1:11434".into(),
             max_concurrent_downloads: 2,
             connections_per_file: 8,
@@ -85,6 +88,9 @@ impl Settings {
     }
     pub fn vllm_venv(&self) -> PathBuf {
         expand(&self.vllm_venv)
+    }
+    pub fn strata_dir(&self) -> PathBuf {
+        expand(&self.strata_dir)
     }
 }
 

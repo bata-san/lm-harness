@@ -227,6 +227,7 @@ export type Settings = {
   hf_endpoint: string
   llama_cpp_dir: string
   vllm_venv: string
+  strata_dir: string
   ollama_url: string
   max_concurrent_downloads: number
   connections_per_file: number

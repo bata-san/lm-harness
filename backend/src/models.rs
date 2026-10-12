@@ -271,10 +271,25 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list_models(State(state): State<AppState>) -> ApiResult<Vec<LocalModel>> {
-    let dir = state.settings.get().models_dir();
-    let models = tokio::task::spawn_blocking(move || scan(&dir))
+    let settings = state.settings.get();
+    let dir = settings.models_dir();
+    let mut models = tokio::task::spawn_blocking(move || scan(&dir))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    // Strata run configs (written by its setup wizard) are launchable "models" for the strata runtime.
+    for cfg in crate::runtimes::strata_configs(&settings) {
+        models.push(LocalModel {
+            name: cfg.trim_start_matches("strata-").trim_end_matches(".json").to_string(),
+            path: settings.strata_dir().join(&cfg).to_string_lossy().into_owned(),
+            id: cfg,
+            format: "strata".into(),
+            size: 0,
+            files: 1,
+            mmproj: None,
+            runtimes: vec!["strata".into()],
+            info: GgufInfo::default(),
+        });
+    }
     Ok(Json(models))
 }
 

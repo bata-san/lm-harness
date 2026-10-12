@@ -255,7 +255,17 @@ impl InstanceManager {
     async fn launch_with(&self, state: &AppState, spec: LaunchSpec, profile: &ModeProfile) -> anyhow::Result<Arc<Instance>> {
         let settings = self.settings.get();
         let host = spec.host.clone().filter(|h| !h.is_empty()).unwrap_or_else(|| settings.default_host.clone());
-        let model_path = if spec.model.is_empty() { String::new() } else { models::resolve(&settings.models_dir(), &spec.model)?.to_string_lossy().into_owned() };
+        let model_path = if spec.model.is_empty() {
+            String::new()
+        } else if spec.runtime == "strata" {
+            // Strata models are run configs inside its own checkout, not files under models_dir.
+            if !runtimes::valid_strata_config(&spec.model) {
+                anyhow::bail!("invalid Strata config {:?}", spec.model);
+            }
+            spec.model.clone()
+        } else {
+            models::resolve(&settings.models_dir(), &spec.model)?.to_string_lossy().into_owned()
+        };
         if spec.runtime != "ollama" && model_path.is_empty() {
             anyhow::bail!("モデルを選択してください");
         }
@@ -416,8 +426,8 @@ async fn check_instance(client: &reqwest::Client, inst: &Instance) {
         inst.proc.log(format!("[harness] ready: http://localhost:{}/v1", inst.port));
     }
     inst.proc.set_alive_status(if ready { Status::Running } else { Status::Starting });
-    if ready && matches!(inst.runtime.as_str(), "llama.cpp" | "vllm") {
-        if let Ok(r) = client.get(format!("{base}/metrics")).send().await {
+    if ready && matches!(inst.runtime.as_str(), "llama.cpp" | "vllm" | "strata") {
+        if let Ok(r) = client.get(format!("{base}{}", runtimes::metrics_path(&inst.runtime))).header("Accept", "text/plain").send().await {
             if r.status().is_success() {
                 if let Ok(text) = r.text().await {
                     inst.live.lock().metrics = runtimes::parse_metrics(&text);

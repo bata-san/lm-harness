@@ -18,6 +18,7 @@ import { MODE_LABEL, useMode } from "@/lib/mode"
 const RUNTIMES = [
   { id: "llama.cpp", label: "llama.cpp (llama-server)" },
   { id: "vllm", label: "vLLM" },
+  { id: "strata", label: "Strata (大型 MoE 専用エンジン)" },
   { id: "ollama", label: "Ollama (serve)" },
 ]
 
@@ -64,7 +65,7 @@ export function LaunchDialog({
   const selected = candidates.find((m) => m.id === model)
 
   // true when the backend computes the tuned args itself and `args` are only user overrides
-  const autoManaged = autoTuneOn && runtime !== "ollama"
+  const autoManaged = autoTuneOn && runtime !== "ollama" && runtime !== "strata"
 
   async function autoTune() {
     if (!model) return toast.error("モデルを選択してください")
@@ -250,7 +251,7 @@ export function LaunchDialog({
             </Alert>
           ) : null}
 
-          {runtime !== "ollama" && (
+          {runtime !== "ollama" && runtime !== "strata" && (
             <div className="flex items-start gap-2">
               <Switch checked={autoTuneOn} onCheckedChange={toggleAutoTune} id="auto_tune" className="mt-0.5" />
               <div className="grid gap-0.5">
