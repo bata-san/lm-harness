@@ -247,6 +247,14 @@ impl InstanceManager {
                 let gpus = tokio::task::spawn_blocking(move || telemetry.gpus()).await.unwrap_or_default();
                 tuning::vllm_args(profile, &gpus)
             }
+            // Strata sizes its VRAM/RAM/SSD expert tiers itself (setup picks the low-RAM mode and the
+            // expert cache is `auto`), so FULL adds nothing. SHARED only hands back what the desktop needs.
+            "strata" => {
+                if profile.mode != Mode::Shared {
+                    return spec.args.clone();
+                }
+                vec!["--vram-reserve-mib".into(), profile.vram_reserve_mb.to_string(), "--pool-workers".into(), profile.physical_cores.max(1).to_string()]
+            }
             _ => return spec.args.clone(),
         };
         tuning::merge_args(&tuned, &spec.args)
