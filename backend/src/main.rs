@@ -3,7 +3,6 @@ mod affinity;
 mod anthropic;
 mod auth;
 mod catalog;
-mod chat;
 mod config;
 mod downloads;
 mod error;
@@ -22,6 +21,7 @@ mod topology;
 mod tunnel;
 mod tuning;
 mod types;
+mod vault;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(catalog::router())
         .merge(proxy::router())
         .merge(anthropic::router())
-        .merge(chat::router())
+        .merge(vault::router())
         .merge(admin::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 

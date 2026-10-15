@@ -51,7 +51,7 @@ use crate::state::AppState;
 const MSG_SESSION_REQUIRED: &str = "管理 API にはログインセッションが必要です (API キーでは使えません)";
 
 /// Route-level gate: only authenticated browser sessions pass.
-async fn session_only(req: Request, next: Next) -> Response {
+pub(crate) async fn session_only(req: Request, next: Next) -> Response {
     match req.extensions().get::<Principal>() {
         Some(Principal { kind: "session", .. }) => next.run(req).await,
         Some(_) => ApiError(StatusCode::FORBIDDEN, MSG_SESSION_REQUIRED.into()).into_response(),
@@ -60,7 +60,7 @@ async fn session_only(req: Request, next: Next) -> Response {
 }
 
 /// The calling admin (second line of defence behind [`session_only`]).
-struct Admin {
+pub(crate) struct Admin {
     user: String,
     ip: String,
 }
