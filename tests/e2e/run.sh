@@ -60,11 +60,13 @@ status 200 "switch to full" -b "$JAR" -X PUT "$BASE/api/mode" \
   -H 'Content-Type: application/json' -H 'X-Harness-CSRF: 1' -d '{"mode":"full"}'
 
 # API key works as a bearer token, and is rejected once revoked.
-KEY_JSON=$(curl -s -b "$JAR" -X POST "$BASE/api/auth/keys" -H 'Content-Type: application/json' -H 'X-Harness-CSRF: 1' -d '{"name":"e2e"}')
-KEY=$(echo "$KEY_JSON" | grep -o 'lh_[A-Za-z0-9_-]*' | head -1)
+KEY_JSON=$(curl -s -b "$JAR" -X POST "$BASE/api/auth/keys" -H 'Content-Type: application/json' -H 'X-Harness-CSRF: 1' -d '{"name":"e2e","kind":"openai"}')
+KEY=$(echo "$KEY_JSON" | grep -o 'sk-lh-[A-Za-z0-9_-]*' | head -1 || true)
 [ -n "$KEY" ] || fail "no API key in response: $KEY_JSON"
-status 200 "API key bearer auth" -H "Authorization: Bearer $KEY" "$BASE/api/system"
-status 401 "garbage bearer rejected" -H "Authorization: Bearer lh_nope" "$BASE/api/system"
+# keys are valid on /v1 only (503 = authenticated, no model running) and refused elsewhere
+status 503 "API key bearer auth on /v1" -H "Authorization: Bearer $KEY" "$BASE/v1/models"
+status 403 "API key refused on admin routes" -H "Authorization: Bearer $KEY" "$BASE/api/system"
+status 401 "garbage bearer rejected" -H "Authorization: Bearer sk-lh-nope" "$BASE/v1/models"
 
 # Frontend is embedded and served.
 curl -sf "$BASE/" | grep -qi '<div id="root"' || fail "SPA index not served"
