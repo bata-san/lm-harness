@@ -59,6 +59,28 @@ pub struct LogTail {
     pub last: u64,
 }
 
+/// Case-insensitive fragments that only show up when a runtime echoes request or response content
+/// (llama-server verbose / slot dumps, JSON request bodies). Status lines do not contain them.
+const CONTENT_MARKERS: [&str; 5] = ["prompt =", "\"messages\"", "\"content\":", "generated text", "decoding prompt"];
+
+/// A `prompt:` / `completion:` label followed by more than this many characters is a dump.
+const LABEL_DUMP_CHARS: usize = 200;
+
+/// Heuristic filter for child output in privacy mode: `true` when the line looks like a
+/// prompt or completion dump. Line based, so a multi-line dump is only partly caught: the
+/// continuation lines are not recognised.
+pub fn looks_like_content_dump(line: &str) -> bool {
+    // to_ascii_lowercase keeps byte offsets, so `pos` is valid in `line` too.
+    let lower = line.to_ascii_lowercase();
+    if CONTENT_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    ["prompt:", "completion:"].iter().any(|label| match lower.find(label) {
+        Some(pos) => line[pos + label.len()..].trim().chars().count() > LABEL_DUMP_CHARS,
+        None => false,
+    })
+}
+
 pub fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
 }
@@ -121,6 +143,8 @@ pub struct Proc {
     env: BTreeMap<String, String>,
     cwd: Option<String>,
     pin: Option<(Vec<usize>, i32)>,
+    /// Drop prompt / completion dumps from the child's output (see [`looks_like_content_dump`]).
+    privacy: bool,
     state: Mutex<State>,
 }
 
@@ -136,6 +160,7 @@ impl Proc {
             env,
             cwd,
             pin: None,
+            privacy: false,
             state: Mutex::new(State { status: Status::Starting, pid: None, returncode: None, ended_at: None, logs: VecDeque::new(), seq: 0, stopping: false }),
         }
     }
@@ -143,6 +168,12 @@ impl Proc {
     /// Start the child already pinned to `cpus` with the given nice value.
     pub fn pinned(mut self, cpus: Vec<usize>, nice: i32) -> Self {
         self.pin = Some((cpus, nice));
+        self
+    }
+
+    /// Filter prompt / completion dumps out of the captured output (privacy mode).
+    pub fn privacy(mut self, on: bool) -> Self {
+        self.privacy = on;
         self
     }
 
@@ -171,6 +202,24 @@ impl Proc {
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
         }
+        #[cfg(target_os = "linux")]
+        {
+            // Children never write core files (they hold prompts and weights in RAM).
+            // SAFETY: only async-signal-safe syscalls (setrlimit, sched_setaffinity, setpriority)
+            // run between fork and exec.
+            let pin = self.pin.clone();
+            unsafe {
+                cmd.pre_exec(move || {
+                    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                    libc::setrlimit(libc::RLIMIT_CORE, &zero);
+                    if let Some((cpus, nice)) = &pin {
+                        affinity::child_setup(cpus.clone(), *nice)()?;
+                    }
+                    Ok(())
+                })
+            };
+        }
+        #[cfg(not(target_os = "linux"))]
         if let Some((cpus, nice)) = &self.pin {
             // SAFETY: the closure only performs async-signal-safe syscalls between fork and exec.
             unsafe { cmd.pre_exec(affinity::child_setup(cpus.clone(), *nice)) };
@@ -223,14 +272,22 @@ impl Proc {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     for line in splitter.push(&chunk[..n]) {
-                        self.log(line);
+                        self.log_child_line(line);
                     }
                 }
             }
         }
         if let Some(line) = splitter.finish() {
-            self.log(line);
+            self.log_child_line(line);
         }
+    }
+
+    /// A line from the child's stdout/stderr: with privacy on, prompt/completion dumps are dropped.
+    fn log_child_line(&self, line: String) {
+        if self.privacy && looks_like_content_dump(&line) {
+            return;
+        }
+        self.log(line);
     }
 
     pub fn log(&self, line: impl Into<String>) {
@@ -422,6 +479,66 @@ mod tests {
             .count();
         assert_eq!(live_members, 0);
         assert!(p.tail(0, 100).lines.iter().any(|l| l.text.starts_with("[harness] プロセス終了")));
+    }
+
+    #[test]
+    fn content_dump_filter_drops_dumps() {
+        let dumps = [
+            "slot launch_slot_: id  0 | task 3 | prompt = \"Tell me my bank PIN\"",
+            "srv  update_slots: decoding prompt, n_tokens = 12",
+            "request: {\"model\": \"m\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}",
+            "    \"content\": \"my private text\",",
+            "srv  process: generated text: Sure, here is the answer",
+            "Generated Text: the completion",
+            "PROMPT:  the rest of the prompt is long enough to count as a dump, lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua, ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat, duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur excepteur sint",
+        ];
+        for line in dumps {
+            assert!(looks_like_content_dump(line), "should drop: {line}");
+        }
+        assert!(looks_like_content_dump(&format!("completion: {}", "a".repeat(LABEL_DUMP_CHARS + 1))));
+        assert!(!looks_like_content_dump(&format!("completion: {}", "a".repeat(LABEL_DUMP_CHARS))));
+    }
+
+    #[test]
+    fn content_dump_filter_keeps_status_lines() {
+        let status = [
+            "main: server is listening on http://127.0.0.1:8080 - starting the main loop",
+            "srv  update_slots: all slots are idle",
+            "slot update_slots: id  0 | task 0 | prompt processing done, n_tokens = 12, batch.n_tokens = 12",
+            "llama_perf_context_print: prompt eval time =     123.45 ms /    12 tokens (   10.29 ms per token)",
+            "llama_perf_context_print:        eval time =    456.00 ms /    64 runs   (    7.12 ms per token)",
+            "load_tensors: loading model tensors, this can take a while... (mmap = true)",
+            "ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12288 MiB)",
+            "prompt: short label",
+            "completion: 42 tokens",
+            "[harness] ready: http://localhost:8080/v1",
+            "",
+        ];
+        for line in status {
+            assert!(!looks_like_content_dump(line), "should keep: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_drops_dumps_from_child_output_only_when_on() {
+        let script = "echo 'slot 0 | prompt = secret words'; echo 'ready'";
+        let on = Proc::new("p1", sh(script), BTreeMap::new(), None, "instance", Map::new()).privacy(true).start().await;
+        let off = Proc::new("p2", sh(script), BTreeMap::new(), None, "instance", Map::new()).start().await;
+        assert!(wait_until(|| !on.alive() && !off.alive()).await);
+        let on_text: Vec<String> = on.tail(0, 100).lines.into_iter().map(|l| l.text).collect();
+        let off_text: Vec<String> = off.tail(0, 100).lines.into_iter().map(|l| l.text).collect();
+        assert!(on_text.iter().any(|l| l == "ready"));
+        // match the child's own line exactly: the `$ <cmd>` header echoes the script text
+        let dump = "slot 0 | prompt = secret words";
+        assert!(!on_text.iter().any(|l| l == dump));
+        assert!(off_text.iter().any(|l| l == dump));
+    }
+
+    #[tokio::test]
+    async fn children_get_no_core_limit() {
+        let p = Proc::new("core", sh("ulimit -c"), BTreeMap::new(), None, "job", Map::new()).start().await;
+        assert!(wait_until(|| !p.alive()).await);
+        assert!(p.tail(0, 100).lines.iter().any(|l| l.text.trim() == "0"), "{:?}", p.tail(0, 100).lines);
     }
 
     #[tokio::test]

@@ -209,7 +209,17 @@ pub(crate) fn upstream_model(target: &Target, requested: &str) -> String {
 
 /// How a failed connection to the upstream is reported: (status, machine code, message).
 fn send_error_parts(e: &reqwest::Error, target: &Target) -> (StatusCode, &'static str, String) {
-    tracing::warn!("proxy to {} failed: {e}", target.base);
+    // Only the error class is logged: the reqwest message embeds the request URL (path + query).
+    let class = if e.is_connect() {
+        "connect"
+    } else if e.is_timeout() {
+        "timeout"
+    } else if e.is_body() || e.is_decode() {
+        "body"
+    } else {
+        "request"
+    };
+    tracing::warn!("proxy to {} failed ({class} error)", target.base);
     let (status, code) = if e.is_connect() || e.is_timeout() { (StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable") } else { (StatusCode::BAD_GATEWAY, "upstream_error") };
     (status, code, format!("Model server is not reachable: {}", target.name))
 }

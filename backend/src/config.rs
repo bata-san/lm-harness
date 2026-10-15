@@ -56,8 +56,17 @@ pub struct Settings {
     pub default_host: String,
     pub port_range_start: u16,
     pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Never persist or log prompts, model output or tool arguments (see docs/PRIVACY.md).
+    /// Enables the child-log line filter and the runtime flags that disable request logging.
+    #[serde(default = "default_privacy_mode")]
+    pub privacy_mode: bool,
     pub mode: ModeSettings,
 }
+
+fn default_privacy_mode() -> bool {
+    true
+}
+
 
 impl Default for Settings {
     fn default() -> Self {
@@ -74,6 +83,7 @@ impl Default for Settings {
             default_host: "127.0.0.1".into(),
             port_range_start: 8080,
             extra_env: Default::default(),
+            privacy_mode: true,
             mode: ModeSettings::default(),
         }
     }
@@ -178,4 +188,19 @@ pub fn read_json<T: DeserializeOwned>(name: &str) -> Option<T> {
 
 pub fn write_json<T: Serialize + ?Sized>(name: &str, value: &T) -> anyhow::Result<()> {
     write_json_file(&HARNESS_HOME.join(name), value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn privacy_mode_defaults_to_true_for_old_files() {
+        // settings.json written before the field existed must load with privacy on
+        let old: Settings = serde_json::from_str(r#"{"models_dir": "/m", "default_host": "127.0.0.1"}"#).unwrap();
+        assert!(old.privacy_mode);
+        assert!(Settings::default().privacy_mode);
+        let off: Settings = serde_json::from_str(r#"{"privacy_mode": false}"#).unwrap();
+        assert!(!off.privacy_mode);
+    }
 }

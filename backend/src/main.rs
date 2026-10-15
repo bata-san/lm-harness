@@ -12,6 +12,7 @@ mod instances;
 mod mode;
 mod models;
 mod power;
+mod privacy;
 mod procs;
 mod proxy;
 mod runtimes;
@@ -95,8 +96,27 @@ fn run_cli(cmd: Command) -> anyhow::Result<()> {
 #[folder = "../frontend/dist"]
 struct Frontend;
 
+/// Keep the harness's memory out of core dumps and off `/proc/<pid>/mem` for other users.
+/// This is hardening, not a guarantee: root and same-user debuggers can still read memory
+/// (see docs/PRIVACY.md). `PR_SET_DUMPABLE` is reset by `execve`, so it does not carry over to
+/// the model servers; those get `RLIMIT_CORE = 0` from `procs.rs` instead.
+#[cfg(target_os = "linux")]
+fn harden_process() {
+    let zero = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain prctl / setrlimit calls with valid arguments; failures are ignored because
+    // hardening is best effort (e.g. restricted containers).
+    unsafe {
+        // prctl is variadic: pass unsigned long arguments explicitly, not untyped int literals.
+        let z: libc::c_ulong = 0;
+        libc::prctl(libc::PR_SET_DUMPABLE, z, z, z, z);
+        libc::setrlimit(libc::RLIMIT_CORE, &zero);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    harden_process();
     // fmt output plus an in-memory ring buffer (last 2000 lines) served by /api/admin/logs?source=harness
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tower_http=warn")))

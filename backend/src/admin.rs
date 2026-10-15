@@ -502,6 +502,7 @@ const SCHEMA: &[KeyMeta] = &[
     KeyMeta { key: "connections_per_file", ty: "integer(1-64)", desc: "フルモードでの 1 ファイルあたりの並列接続数 (反映にはモード再適用か再起動が必要)", restart: true },
     KeyMeta { key: "default_host", ty: "host", desc: "起動するモデルサーバのバインドアドレス (新規起動から有効)", restart: false },
     KeyMeta { key: "port_range_start", ty: "port(1024-65535)", desc: "モデルサーバに割り当てるポート範囲の開始番号", restart: false },
+    KeyMeta { key: "privacy_mode", ty: "bool", desc: "プロンプト/出力をログに残さない (推奨)", restart: false },
     KeyMeta { key: "extra_env", ty: "env-map", desc: "モデルサーバ起動時に追加する環境変数 (新規起動から有効)。/api/admin/env でも編集できます", restart: false },
     KeyMeta { key: "mode", ty: "object", desc: "性能モード設定 (共有モードの上限・スケジュール)。現在のモード切替は /api/mode を使用", restart: true },
 ];

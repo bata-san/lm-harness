@@ -24,6 +24,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 
+use crate::privacy;
 use crate::proxy::{self, Target};
 use crate::state::AppState;
 
@@ -64,10 +65,9 @@ fn error_type_for(status: StatusCode) -> &'static str {
 async fn upstream_failure(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
-    let msg = serde_json::from_str::<Value>(&text)
-        .ok()
-        .and_then(|v| v.pointer("/error/message").or_else(|| v.get("message")).and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| if text.trim().is_empty() { format!("upstream returned HTTP {}", status.as_u16()) } else { text.chars().take(500).collect() });
+    // The body may hold prompt text: the client gets a truncated message, the log gets the size only.
+    tracing::warn!("{}", privacy::upstream_log_summary(status.as_u16(), text.len()));
+    let msg = privacy::upstream_error_message(status.as_u16(), &text);
     let out_status = if status.is_client_error() || status.is_server_error() { status } else { StatusCode::BAD_GATEWAY };
     anth_error(out_status, error_type_for(out_status), msg)
 }
@@ -539,6 +539,7 @@ fn stream_response(upstream: reqwest::Response, model: String, input_estimate: u
                                 tr.finish()
                             } else if let Ok(v) = serde_json::from_str::<Value>(&data) {
                                 if let Some(msg) = v.pointer("/error/message").and_then(Value::as_str) {
+                                    let msg = privacy::truncate_chars(msg, privacy::ECHO_MAX_CHARS);
                                     let e = ("error", json!({"type": "error", "error": {"type": "api_error", "message": msg}}));
                                     let _ = tx.send(sse_bytes(&e)).await;
                                     return;

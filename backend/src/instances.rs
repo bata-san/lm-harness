@@ -289,7 +289,7 @@ impl InstanceManager {
         } else {
             spec.runtime.clone()
         };
-        let proc = Proc::new(name, cmd, env, None, "instance", Map::new()).pinned(profile.cpu_set.clone(), profile.nice).start().await;
+        let proc = Proc::new(name, cmd, env, None, "instance", Map::new()).pinned(profile.cpu_set.clone(), profile.nice).privacy(settings.privacy_mode).start().await;
         let inst = Arc::new(Instance {
             proc,
             runtime: spec.runtime.clone(),
@@ -326,10 +326,11 @@ impl InstanceManager {
         if let Some(j) = self.jobs.lock().iter().find(|j| j.alive() && j.meta.get("job").and_then(Value::as_str) == Some(job_id)) {
             return Ok(j.clone());
         }
-        let (cmd, env) = runtimes::job_command(job_id, &self.settings.get())?;
+        let settings = self.settings.get();
+        let (cmd, env) = runtimes::job_command(job_id, &settings)?;
         let profile = state.profile();
         let meta = Map::from_iter([("job".to_string(), json!(job_id))]);
-        let proc = Proc::new(def.title, cmd, env, None, "job", meta).pinned(profile.cpu_set.clone(), profile.nice).start().await;
+        let proc = Proc::new(def.title, cmd, env, None, "job", meta).pinned(profile.cpu_set.clone(), profile.nice).privacy(settings.privacy_mode).start().await;
         proc.set_alive_status(Status::Running);
         self.jobs.lock().push(proc.clone());
         // versions change after an install/build finishes

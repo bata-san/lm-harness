@@ -228,6 +228,32 @@ pub async fn status(s: &Settings) -> Vec<RuntimeStatus> {
 }
 
 // ------------------------------------------------------------------- command
+/// llama-server flags that echo prompts / slot contents into its log or to disk.
+const LLAMA_CONTENT_FLAGS: [&str; 3] = ["--verbose", "-v", "--slot-save-path"];
+/// Strata flags that echo request traffic or write slot contents to disk.
+const STRATA_CONTENT_FLAGS: [&str; 2] = ["--api-monitor", "--slot-save-path"];
+/// vLLM flags that switch per-request logging on or off.
+const VLLM_LOG_REQUEST_FLAGS: [&str; 2] = ["--disable-log-requests", "--enable-log-requests"];
+
+/// The flag part of an argument: `--flag=value` and `--flag` both give `--flag`.
+fn flag_name(arg: &str) -> &str {
+    arg.split_once('=').map_or(arg, |(name, _)| name)
+}
+
+/// The first argument that is one of `names`, if any.
+fn find_flag<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
+    args.iter().map(String::as_str).find(|a| names.contains(&flag_name(a)))
+}
+
+/// Privacy mode: refuse user arguments that would make the runtime write request content to
+/// its log or to disk. Rejecting (instead of silently dropping) keeps the profile honest.
+fn forbid_content_flags(runtime: &str, args: &[String], names: &[&str]) -> anyhow::Result<()> {
+    match find_flag(args, names) {
+        Some(flag) => anyhow::bail!("プライバシーモードでは {runtime} の {flag} は使用できません (プロンプトや出力が書き出されるため)。引数から外すか、設定 privacy_mode を無効にしてください"),
+        None => Ok(()),
+    }
+}
+
 /// `(argv, env)` for starting a server. `env` holds only the additions to the inherited environment.
 pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, args: &[String], s: &Settings) -> anyhow::Result<(Vec<String>, BTreeMap<String, String>)> {
     let mut env: BTreeMap<String, String> = s.extra_env.clone();
@@ -237,6 +263,9 @@ pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, arg
             let Some(bin) = llama_server_bin(s) else {
                 anyhow::bail!("llama-server が見つかりません。Runtimes から llama.cpp をビルドしてください");
             };
+            if s.privacy_mode {
+                forbid_content_flags("llama.cpp", args, &LLAMA_CONTENT_FLAGS)?;
+            }
             let mut cmd = vec![exe(bin), "-m".into(), model_path.to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
             cmd.extend(args.iter().cloned());
             Ok((cmd, env))
@@ -247,6 +276,11 @@ pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, arg
             };
             env.entry("VLLM_USE_V1".into()).or_insert_with(|| "1".into());
             let mut cmd = vec![exe(bin), "serve".into(), model_path.to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
+            // Privacy mode: no per-request log lines (they include prompt text). An explicit
+            // choice in the user's args, either way, is respected.
+            if s.privacy_mode && find_flag(args, &VLLM_LOG_REQUEST_FLAGS).is_none() {
+                cmd.push("--disable-log-requests".into());
+            }
             cmd.extend(args.iter().cloned());
             Ok((cmd, env))
         }
@@ -260,6 +294,9 @@ pub fn build_command(runtime: &str, model_path: &str, host: &str, port: u16, arg
             let cfg = s.strata_dir().join(model_path_name(model_path));
             if !cfg.is_file() {
                 anyhow::bail!("設定ファイル {} がありません。strata ディレクトリで ./setup.sh を実行してください", cfg.display());
+            }
+            if s.privacy_mode {
+                forbid_content_flags("Strata", args, &STRATA_CONTENT_FLAGS)?;
             }
             let mut cmd = vec![exe(py), "-m".into(), "serve.server".into(), "--engine".into(), "strata".into(), "--config".into(), cfg.display().to_string(), "--host".into(), host.to_string(), "--port".into(), port.to_string()];
             cmd.extend(args.iter().cloned());
@@ -460,5 +497,83 @@ unrelated_metric 99
         assert_eq!(cmd[1..], ["-m", "/m/a.gguf", "--host", "127.0.0.1", "--port", "8080", "-c", "4096"]);
         assert_eq!(env["X"], "1");
         assert!(build_command("bogus", "", "h", 1, &[], &s).is_err());
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Fake llama-server, vLLM venv and Strata checkout under one temp dir.
+    fn fake_install(dir: &Path) -> Settings {
+        std::fs::create_dir_all(dir.join("llama/build/bin")).unwrap();
+        std::fs::write(dir.join("llama/build/bin/llama-server"), "").unwrap();
+        std::fs::create_dir_all(dir.join("venv/bin")).unwrap();
+        std::fs::write(dir.join("venv/bin/vllm"), "").unwrap();
+        std::fs::create_dir_all(dir.join("strata/.venv/bin")).unwrap();
+        std::fs::create_dir_all(dir.join("strata/serve")).unwrap();
+        std::fs::write(dir.join("strata/.venv/bin/python"), "").unwrap();
+        std::fs::write(dir.join("strata/serve/server.py"), "").unwrap();
+        std::fs::write(dir.join("strata/strata-a.json"), "{}").unwrap();
+        Settings {
+            llama_cpp_dir: dir.join("llama").display().to_string(),
+            vllm_venv: dir.join("venv").display().to_string(),
+            strata_dir: dir.join("strata").display().to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn privacy_mode_is_on_by_default_and_blocks_llama_content_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fake_install(dir.path());
+        assert!(s.privacy_mode);
+        for bad in ["-v", "--verbose", "--slot-save-path", "--slot-save-path=/tmp/x"] {
+            assert!(build_command("llama.cpp", "/m/a.gguf", "127.0.0.1", 8080, &strs(&["-c", "512", bad]), &s).is_err(), "{bad} must be refused");
+        }
+        // unrelated flags that only share a prefix are fine
+        let (cmd, _) = build_command("llama.cpp", "/m/a.gguf", "127.0.0.1", 8080, &strs(&["--verbose-prompt", "--log-disable"]), &s).unwrap();
+        assert!(cmd.contains(&"--verbose-prompt".to_string()));
+        // with privacy off the user is in charge
+        s.privacy_mode = false;
+        assert!(build_command("llama.cpp", "/m/a.gguf", "127.0.0.1", 8080, &strs(&["-v"]), &s).is_ok());
+        // llama.cpp never gets --disable-log-requests (vLLM only)
+        s.privacy_mode = true;
+        let (cmd, _) = build_command("llama.cpp", "/m/a.gguf", "127.0.0.1", 8080, &[], &s).unwrap();
+        assert!(!cmd.iter().any(|a| a.starts_with("--disable-log") || a == "-v" || a == "--verbose" || a.starts_with("--slot-save")));
+    }
+
+    #[test]
+    fn vllm_gets_disable_log_requests_in_privacy_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fake_install(dir.path());
+        let count = |cmd: &[String]| cmd.iter().filter(|a| *a == "--disable-log-requests").count();
+
+        let (cmd, _) = build_command("vllm", "/m/org/model", "127.0.0.1", 8000, &strs(&["--max-model-len", "8192"]), &s).unwrap();
+        assert_eq!(count(&cmd), 1, "added in privacy mode: {cmd:?}");
+        assert!(cmd.contains(&"8192".to_string()));
+
+        // already requested by the user: not duplicated
+        let (cmd, _) = build_command("vllm", "/m/org/model", "127.0.0.1", 8000, &strs(&["--disable-log-requests"]), &s).unwrap();
+        assert_eq!(count(&cmd), 1);
+        // the user explicitly re-enabled request logs: respected
+        let (cmd, _) = build_command("vllm", "/m/org/model", "127.0.0.1", 8000, &strs(&["--enable-log-requests"]), &s).unwrap();
+        assert_eq!(count(&cmd), 0);
+        // privacy off: nothing added
+        s.privacy_mode = false;
+        let (cmd, _) = build_command("vllm", "/m/org/model", "127.0.0.1", 8000, &[], &s).unwrap();
+        assert_eq!(count(&cmd), 0);
+    }
+
+    #[test]
+    fn strata_refuses_api_monitor_and_slot_save_in_privacy_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = fake_install(dir.path());
+        for bad in ["--api-monitor", "--slot-save-path=/x"] {
+            assert!(build_command("strata", "strata-a.json", "127.0.0.1", 8090, &strs(&[bad]), &s).is_err(), "{bad}");
+        }
+        let (cmd, _) = build_command("strata", "strata-a.json", "127.0.0.1", 8090, &strs(&["--lazy"]), &s).unwrap();
+        assert!(!cmd.iter().any(|a| a == "--api-monitor" || a.starts_with("--slot-save-path")));
+        s.privacy_mode = false;
+        assert!(build_command("strata", "strata-a.json", "127.0.0.1", 8090, &strs(&["--api-monitor"]), &s).is_ok());
     }
 }
