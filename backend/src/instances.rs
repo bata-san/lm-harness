@@ -308,7 +308,9 @@ impl InstanceManager {
         } else {
             spec.runtime.clone()
         };
-        let proc = Proc::new(name, cmd, env, None, "instance", Map::new()).pinned(profile.cpu_set.clone(), profile.nice).privacy(settings.privacy_mode).start().await;
+        // `python -m serve.server` resolves `serve` relative to the Strata checkout.
+        let cwd = (spec.runtime == "strata").then(|| settings.strata_dir().to_string_lossy().into_owned());
+        let proc = Proc::new(name, cmd, env, cwd, "instance", Map::new()).pinned(profile.cpu_set.clone(), profile.nice).privacy(settings.privacy_mode).start().await;
         let inst = Arc::new(Instance {
             proc,
             runtime: spec.runtime.clone(),
