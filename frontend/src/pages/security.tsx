@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import { CheckIcon, CopyIcon, KeyRoundIcon, Loader2Icon, MonitorSmartphoneIcon, PlusIcon, ShieldCheckIcon, SmartphoneIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
+import { CheckIcon, CopyIcon, InfoIcon, KeyRoundIcon, Loader2Icon, MonitorSmartphoneIcon, PlusIcon, ShieldCheckIcon, SmartphoneIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
 import { toast } from "sonner"
 
 import { CodeBlock } from "@/components/code-block"
@@ -14,10 +14,12 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { api, usePoll, type ApiKey, type AuthSession } from "@/lib/api"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { api, usePoll, type ApiKey, type ApiKeyKind, type AuthSession, type CreatedApiKey } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { copyText } from "@/lib/clipboard"
 import { ago, dateTime } from "@/lib/format"
+import { cn } from "@/lib/utils"
 
 export function SecurityPage() {
   return (
@@ -331,26 +333,78 @@ function SessionsCard() {
 
 /* ------------------------------------------------------------------ API keys */
 
-export function ApiUsage({ keyText }: { keyText: string }) {
-  const origin = location.origin
+const KEY_KINDS: { value: ApiKeyKind; label: string; prefix: string; desc: string }[] = [
+  { value: "openai", label: "OpenAI 形式", prefix: "sk-lh-…", desc: "OpenAI SDK や OpenAI 互換のアプリから使います。" },
+  { value: "anthropic", label: "Anthropic 形式", prefix: "sk-ant-lh-…", desc: "Anthropic SDK や Claude Code から使います。" },
+  { value: "generic", label: "汎用", prefix: "lh_…", desc: "旧来の形式です。新しく作るなら OpenAI / Anthropic 形式を選んでください。" },
+]
+
+const KIND_BADGE: Record<ApiKeyKind, { label: string; className: string }> = {
+  openai: { label: "OpenAI", className: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400" },
+  anthropic: { label: "Anthropic", className: "bg-orange-500/15 text-orange-700 dark:text-orange-400" },
+  generic: { label: "汎用", className: "bg-muted text-muted-foreground" },
+}
+
+type UsageSnippet = { label: string; code: string; note?: string }
+
+/** Copy-ready snippets for one key. The key only appears in headers, env vars or code, never in a URL. */
+function usageSnippets(kind: ApiKeyKind, origin: string, key: string): UsageSnippet[] {
+  if (kind === "anthropic") {
+    return [
+      {
+        label: "環境変数",
+        code: `export ANTHROPIC_BASE_URL=${origin}\nexport ANTHROPIC_API_KEY=${key}`,
+        note: "Claude Code も同じ環境変数で使えます。",
+      },
+      {
+        label: "Python",
+        code: `import anthropic\n\nclient = anthropic.Anthropic(\n    base_url="${origin}",\n    api_key="${key}",\n)`,
+      },
+      {
+        label: "curl",
+        code: `curl ${origin}/v1/messages \\\n  -H "x-api-key: ${key}" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -H "content-type: application/json" \\\n  -d '{"model": "YOUR_MODEL", "max_tokens": 1024, "messages": [{"role": "user", "content": "Hello"}]}'`,
+        note: "YOUR_MODEL は GET /v1/models で確認できます。",
+      },
+    ]
+  }
+  return [
+    {
+      label: "Python",
+      code: `from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${origin}/v1",\n    api_key="${key}",\n)`,
+    },
+    {
+      label: "curl",
+      code: `curl ${origin}/v1/chat/completions \\\n  -H "Authorization: Bearer ${key}" \\\n  -H "content-type: application/json" \\\n  -d '{"model": "YOUR_MODEL", "messages": [{"role": "user", "content": "Hello"}]}'`,
+      note: "YOUR_MODEL は GET /v1/models で確認できます。",
+    },
+  ]
+}
+
+function UsageSnippets({ kind, keyText }: { kind: ApiKeyKind; keyText: string }) {
+  const snippets = usageSnippets(kind, window.location.origin, keyText)
   return (
-    <div className="grid gap-3">
-      <div className="grid gap-1">
-        <span className="text-xs font-medium text-muted-foreground">curl</span>
-        <CodeBlock code={`curl ${origin}/v1/models \\\n  -H "Authorization: Bearer ${keyText}"`} />
-      </div>
-      <div className="grid gap-1">
-        <span className="text-xs font-medium text-muted-foreground">OpenAI SDK (Python)</span>
-        <CodeBlock code={`from openai import OpenAI\n\nclient = OpenAI(\n    base_url="${origin}/v1",\n    api_key="${keyText}",\n)`} />
-      </div>
-    </div>
+    <Tabs defaultValue={snippets[0].label} className="min-w-0 gap-2">
+      <TabsList className="w-full">
+        {snippets.map((s) => (
+          <TabsTrigger key={s.label} value={s.label}>
+            {s.label}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+      {snippets.map((s) => (
+        <TabsContent key={s.label} value={s.label} className="grid min-w-0 gap-2">
+          <CodeBlock code={s.code} className="min-w-0" />
+          {s.note && <p className="text-xs text-muted-foreground">{s.note}</p>}
+        </TabsContent>
+      ))}
+    </Tabs>
   )
 }
 
 function ApiKeysCard() {
   const { data, refetch } = usePoll<ApiKey[]>("/auth/keys", 15000)
   const [createOpen, setCreateOpen] = useState(false)
-  const [created, setCreated] = useState<{ id: string; name: string; key: string } | null>(null)
+  const [created, setCreated] = useState<CreatedApiKey | null>(null)
   const [del, setDel] = useState<ApiKey | null>(null)
 
   return (
@@ -360,35 +414,44 @@ function ApiKeysCard() {
           <KeyRoundIcon className="size-4" /> API キー
         </CardTitle>
         <CardDescription>
-          OpenAI 互換プロキシ <code className="font-mono">{location.origin}/v1</code> を外部のアプリ / スクリプトから使うためのキー。パネルの管理画面には使えません。
+          OpenAI / Anthropic 互換の <code className="font-mono">{location.origin}/v1</code> を外部のアプリ / スクリプトから使うためのキーです。
         </CardDescription>
       </CardHeader>
       <CardContent className="grid gap-4">
+        <Alert>
+          <InfoIcon />
+          <AlertDescription>これらのキーは /v1 の推論 API 専用で、管理画面の操作はできません</AlertDescription>
+        </Alert>
         <div className="grid gap-2">
+          {!data && <p className="text-sm text-muted-foreground">読み込み中…</p>}
           {data?.length === 0 && <p className="text-sm text-muted-foreground">API キーはまだありません</p>}
-          {(data ?? []).map((k) => (
-            <div key={k.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border p-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-medium">{k.name}</span>
-                  <code className="font-mono text-xs text-muted-foreground">{k.prefix}…</code>
+          {(data ?? []).map((k) => {
+            const badge = KIND_BADGE[k.kind] ?? KIND_BADGE.generic
+            const lastUsed = k.last_used ?? k.last_used_at
+            return (
+              <div key={k.id} className="flex items-center gap-3 rounded-lg border p-3">
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium break-all">{k.name}</span>
+                    <Badge className={badge.className}>{badge.label}</Badge>
+                  </div>
+                  <code className="block font-mono text-xs break-all text-muted-foreground">{k.prefix}…</code>
+                  <div className="text-xs text-muted-foreground">
+                    作成 {dateTime(k.created_at)} · {lastUsed ? `最終利用 ${ago(lastUsed)}` : "未使用"}
+                  </div>
                 </div>
-                <div className="text-xs text-muted-foreground">
-                  作成 {dateTime(k.created_at)} · {k.last_used_at ? `最終利用 ${ago(k.last_used_at)}` : "未使用"}
-                </div>
+                <Button size="icon-sm" variant="ghost" title="削除" aria-label={`${k.name} を削除`} onClick={() => setDel(k)}>
+                  <Trash2Icon />
+                </Button>
               </div>
-              <Button size="icon-sm" variant="ghost" title="削除" aria-label={`${k.name} を削除`} onClick={() => setDel(k)}>
-                <Trash2Icon />
-              </Button>
-            </div>
-          ))}
+            )
+          })}
         </div>
         <div>
           <Button onClick={() => setCreateOpen(true)}>
             <PlusIcon /> API キーを作成
           </Button>
         </div>
-        <ApiUsage keyText="lh_..." />
       </CardContent>
 
       <CreateKeyDialog
@@ -419,11 +482,15 @@ function ApiKeysCard() {
   )
 }
 
-function CreateKeyDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpenChange: (o: boolean) => void; onCreated: (k: { id: string; name: string; key: string }) => void }) {
+function CreateKeyDialog({ open, onOpenChange, onCreated }: { open: boolean; onOpenChange: (o: boolean) => void; onCreated: (k: CreatedApiKey) => void }) {
   const [name, setName] = useState("")
+  const [kind, setKind] = useState<ApiKeyKind>("openai")
   const [pending, setPending] = useState(false)
   useEffect(() => {
-    if (!open) setName("")
+    if (!open) {
+      setName("")
+      setKind("openai")
+    }
   }, [open])
 
   async function submit(e: React.FormEvent) {
@@ -431,7 +498,7 @@ function CreateKeyDialog({ open, onOpenChange, onCreated }: { open: boolean; onO
     if (!name.trim() || pending) return
     setPending(true)
     try {
-      const k = await api<{ id: string; name: string; key: string }>("/auth/keys", { method: "POST", json: { name: name.trim() } })
+      const k = await api<CreatedApiKey>("/auth/keys", { method: "POST", json: { name: name.trim(), kind } })
       onOpenChange(false)
       onCreated(k)
     } catch (err) {
@@ -443,16 +510,37 @@ function CreateKeyDialog({ open, onOpenChange, onCreated }: { open: boolean; onO
 
   return (
     <Dialog open={open} onOpenChange={(o) => !pending && onOpenChange(o)}>
-      <DialogContent>
+      <DialogContent className="max-h-[90dvh] overflow-y-auto">
         <form onSubmit={submit} className="grid gap-4">
           <DialogHeader>
             <DialogTitle>API キーを作成</DialogTitle>
-            <DialogDescription>どこで使うキーか分かる名前を付けてください (例: スマホアプリ, VSCode)。</DialogDescription>
+            <DialogDescription>どこで使うキーか分かる名前を付け、形式を選んでください。</DialogDescription>
           </DialogHeader>
           <div className="grid gap-1.5">
             <Label htmlFor="key-name">名前</Label>
-            <Input id="key-name" autoFocus maxLength={64} value={name} onChange={(e) => setName(e.target.value)} />
+            <Input id="key-name" autoFocus maxLength={64} placeholder="例: スマホアプリ, VSCode" value={name} onChange={(e) => setName(e.target.value)} />
           </div>
+          <fieldset className="grid gap-2">
+            <legend className="mb-1.5 text-sm font-medium">形式</legend>
+            {KEY_KINDS.map((o) => (
+              <label
+                key={o.value}
+                className={cn(
+                  "flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/50",
+                  kind === o.value && "border-primary bg-primary/5 ring-1 ring-primary"
+                )}
+              >
+                <input type="radio" name="key-kind" value={o.value} checked={kind === o.value} onChange={() => setKind(o.value)} className="mt-1 size-4 shrink-0 accent-primary" />
+                <span className="grid min-w-0 gap-0.5">
+                  <span className="flex flex-wrap items-baseline gap-2 text-sm font-medium">
+                    {o.label}
+                    <code className="font-mono text-xs font-normal text-muted-foreground">{o.prefix}</code>
+                  </span>
+                  <span className="text-xs text-muted-foreground">{o.desc}</span>
+                </span>
+              </label>
+            ))}
+          </fieldset>
           <DialogFooter>
             <Button type="button" variant="outline" disabled={pending} onClick={() => onOpenChange(false)}>
               キャンセル
@@ -468,7 +556,7 @@ function CreateKeyDialog({ open, onOpenChange, onCreated }: { open: boolean; onO
 }
 
 /** Shows a freshly created key exactly once; can only be closed after an explicit acknowledgement. */
-function KeyShownDialog({ created, onClose }: { created: { id: string; name: string; key: string } | null; onClose: () => void }) {
+function KeyShownDialog({ created, onClose }: { created: CreatedApiKey | null; onClose: () => void }) {
   const [ack, setAck] = useState(false)
   useEffect(() => {
     setAck(false)
@@ -478,20 +566,22 @@ function KeyShownDialog({ created, onClose }: { created: { id: string; name: str
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg" showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>API キーを作成しました</DialogTitle>
-          <DialogDescription>「{created?.name}」</DialogDescription>
+          <DialogDescription>
+            「{created?.name}」 · {created ? KIND_BADGE[created.kind]?.label : ""}
+          </DialogDescription>
         </DialogHeader>
         <Alert variant="destructive">
           <TriangleAlertIcon />
-          <AlertTitle>このキーは今しか表示されません</AlertTitle>
-          <AlertDescription>画面を閉じると二度と確認できません。今コピーして安全な場所 (パスワードマネージャー等) に保存してください。</AlertDescription>
+          <AlertTitle>この画面を閉じると二度と表示されません</AlertTitle>
+          <AlertDescription>今コピーして、パスワードマネージャー等の安全な場所に保存してください。</AlertDescription>
         </Alert>
-        <div className="flex items-center gap-1">
+        <div className="flex items-start gap-1">
           <code className="min-w-0 flex-1 rounded-lg border bg-muted/50 px-2 py-2 font-mono text-xs break-all select-all">{created?.key}</code>
-          <Button type="button" size="icon" variant="outline" title="コピー" onClick={() => created && void copyText(created.key, "API キーをコピーしました")}>
+          <Button type="button" size="icon" variant="outline" title="コピー" aria-label="API キーをコピー" onClick={() => created && void copyText(created.key, "API キーをコピーしました")}>
             <CopyIcon />
           </Button>
         </div>
-        {created && <ApiUsage keyText={created.key} />}
+        {created && <UsageSnippets key={created.id} kind={created.kind} keyText={created.key} />}
         <Label className="items-start gap-2 font-normal">
           <Checkbox checked={ack} onCheckedChange={(v) => setAck(v === true)} className="mt-0.5" />
           <span>キーを安全な場所に保存しました</span>

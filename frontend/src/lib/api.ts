@@ -296,7 +296,20 @@ export type AuthStatus = {
   principal_kind: string | null
 }
 export type AuthSession = { id: string; created_at: number; last_seen_at: number; ip: string; user_agent: string; current: boolean }
-export type ApiKey = { id: string; name: string; prefix: string; created_at: number; last_used_at: number | null }
+/** "openai" -> sk-lh-…, "anthropic" -> sk-ant-lh-…, "generic" -> lh_… (legacy, still valid). */
+export type ApiKeyKind = "openai" | "anthropic" | "generic"
+/** GET /api/auth/keys row (never contains the secret). */
+export type ApiKey = {
+  id: string
+  name: string
+  kind: ApiKeyKind
+  prefix: string
+  created_at: number
+  last_used: number | null
+  last_used_at: number | null
+}
+/** POST /api/auth/keys response; `key` is the full secret and is returned only here. */
+export type CreatedApiKey = { id: string; name: string; kind: ApiKeyKind; key: string; prefix: string; created_at: number }
 
 // ---- tunnel ----
 export type TunnelProvider = "cloudflare_quick" | "cloudflare_token" | "ngrok"
