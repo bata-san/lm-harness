@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react"
-import { BoxesIcon, DownloadIcon, GaugeIcon, GlobeIcon, KeyRoundIcon, LockKeyholeIcon, LogOutIcon, MoonIcon, ServerIcon, SettingsIcon, ShieldCheckIcon, ShieldIcon, SlidersHorizontalIcon, SunIcon, UserIcon, WrenchIcon } from "lucide-react"
+import { lazy, Suspense, useEffect, useState } from "react"
+import { BoxesIcon, DownloadIcon, GaugeIcon, GlobeIcon, KeyRoundIcon, Loader2Icon, LockKeyholeIcon, LogOutIcon, MessageSquareIcon, MoonIcon, ServerIcon, SettingsIcon, ShieldCheckIcon, ShieldIcon, SlidersHorizontalIcon, SunIcon, UserIcon, WrenchIcon } from "lucide-react"
 
 import { MODE_ICON, ModeSwitch } from "@/components/mode-switch"
 import { Button } from "@/components/ui/button"
@@ -38,7 +38,11 @@ import { ServersPage } from "@/pages/servers"
 import { SecurityPage } from "@/pages/security"
 import { SettingsPage } from "@/pages/settings"
 
+// The chat page pulls in markdown rendering and the vault code; load it on demand.
+const ChatPage = lazy(() => import("@/pages/chat").then((m) => ({ default: m.ChatPage })))
+
 const PAGES = {
+  chat: { title: "チャット", icon: MessageSquareIcon, el: ChatPage },
   dashboard: { title: "ダッシュボード", icon: GaugeIcon, el: DashboardPage },
   downloads: { title: "ダウンロード", icon: DownloadIcon, el: DownloadsPage },
   models: { title: "モデル", icon: BoxesIcon, el: ModelsPage },
@@ -55,7 +59,7 @@ type PageId = keyof typeof PAGES
 function useHashRoute(): [PageId, (p: PageId, anchor?: string) => void] {
   const read = () => {
     const h = location.hash.slice(1)
-    return (h in PAGES ? h : "dashboard") as PageId
+    return (h in PAGES ? h : "chat") as PageId
   }
   const [page, setPage] = useState<PageId>(read)
   useEffect(() => {
@@ -240,7 +244,15 @@ function Shell() {
             </div>
           </header>
           <main className="min-w-0 p-3 sm:p-4 md:p-6">
-            <Page />
+            <Suspense
+              fallback={
+                <div className="flex justify-center py-16 text-muted-foreground">
+                  <Loader2Icon className="animate-spin" />
+                </div>
+              }
+            >
+              <Page />
+            </Suspense>
           </main>
         </SidebarInset>
       </SidebarProvider>

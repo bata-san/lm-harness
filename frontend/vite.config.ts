@@ -10,6 +10,6 @@ export default defineConfig({
   },
   build: { chunkSizeWarningLimit: 1000 },
   server: {
-    proxy: { '/api': 'http://127.0.0.1:8787' },
+    proxy: { '/api': 'http://127.0.0.1:8787', '/v1': 'http://127.0.0.1:8787' },
   },
 })

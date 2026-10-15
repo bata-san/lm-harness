@@ -20,6 +20,11 @@ export function onUnauthorized(fn: () => void): () => void {
   }
 }
 
+/** Broadcast a 401 from a request that does not go through api() (e.g. streaming fetches). */
+export function reportUnauthorized(): void {
+  unauthorizedListeners.forEach((fn) => fn())
+}
+
 export async function api<T = unknown>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
   const { json, headers, ...rest } = init ?? {}
   const h = new Headers(headers)
