@@ -1157,6 +1157,9 @@ pub fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    /// The ring buffer is process-global; tests that fill or read it must not interleave.
+    static RING_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn router_builds_without_route_conflicts() {
         let _ = router();
@@ -1402,6 +1405,7 @@ mod tests {
 
     #[test]
     fn ring_buffer_keeps_last_lines() {
+        let _g = RING_TEST_LOCK.lock();
         {
             let mut r = RING.lock();
             r.clear();
@@ -1420,6 +1424,7 @@ mod tests {
 
     #[test]
     fn ring_layer_captures_events() {
+        let _g = RING_TEST_LOCK.lock();
         use tracing_subscriber::prelude::*;
         RING.lock().clear();
         let sub = tracing_subscriber::registry().with(RingLayer);
