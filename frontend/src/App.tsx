@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils"
 import { MODE_LABEL, MODE_STYLE, ModeProvider, profileSummary, useMode } from "@/lib/mode"
 import { DashboardPage } from "@/pages/dashboard"
 import { DownloadsPage } from "@/pages/downloads"
+import { AdminPage } from "@/pages/admin"
 import { ModePage } from "@/pages/mode"
 import { ModelsPage } from "@/pages/models"
 import { RemotePage } from "@/pages/remote"
@@ -47,6 +48,7 @@ const PAGES = {
   security: { title: "セキュリティ", icon: ShieldIcon, el: SecurityPage },
   runtimes: { title: "ランタイム", icon: WrenchIcon, el: RuntimesPage },
   settings: { title: "設定", icon: SettingsIcon, el: SettingsPage },
+  admin: { title: "管理", icon: ShieldCheckIcon, el: AdminPage },
 } as const
 type PageId = keyof typeof PAGES
 
