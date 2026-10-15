@@ -4,7 +4,6 @@
 #   ./harness.sh [start]   起動 (http://localhost:8787)
 #   ./harness.sh dev       開発モード (cargo run + Vite HMR :5173)
 #   ./harness.sh service   systemd --user に登録して WSL 起動時に自動起動
-#   ./harness.sh dots      OpenDots (apps/opendots) をハーネスの /v1 につないで起動 (:4310)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 export PORT="${PORT:-8787}"
@@ -41,31 +40,10 @@ dev() {
   cd "$ROOT/frontend" && npm run dev -- --host
 }
 
-dots() {
-  local d="$ROOT/apps/opendots"
-  command -v node >/dev/null || { echo "Node.js 24 が必要です"; exit 1; }
-  if [ ! -f "$d/.env" ]; then
-    # テレメトリ無効・ローカル bind・ハーネスの OpenAI 互換 API を向けた .env を作る
-    {
-      echo "HOST=127.0.0.1"; echo "PORT=4310"
-      echo "OPENAI_BASE_URL=http://127.0.0.1:$PORT/v1"
-      echo "# ハーネスの『セキュリティ』画面で OpenAI 形式の API キーを発行して貼る"
-      echo "OPENAI_API_KEY="; echo "# ハーネスで起動しているモデル名 (/v1/models の id)"; echo "OPENAI_MODEL="
-      echo "# 会話の保存に CopilotKit Intelligence が必要: docs/SETUP.md 参照"
-      echo "CPK_INTELLIGENCE_API_KEY="
-      echo "WEB_SEARCH_PROVIDER=disabled"; echo "COPILOTKIT_TELEMETRY_DISABLED=true"; echo "DO_NOT_TRACK=1"
-    } > "$d/.env"
-    echo "==> $d/.env を作成しました。OPENAI_API_KEY / OPENAI_MODEL / CPK_INTELLIGENCE_API_KEY を設定して再実行してください"
-    exit 0
-  fi
-  (cd "$d" && [ -d node_modules ] || npm ci) && (cd "$d" && npm run build >/dev/null) && cd "$d" && exec npm start
-}
-
 case "${1:-start}" in
   install) install ;;
   start) start ;;
   dev) dev ;;
-  dots) dots ;;
   service) [ -x "$BIN" ] || install; bash "$ROOT/scripts/wsl/install-service.sh" ;;
-  *) sed -n '2,8p' "$0"; exit 1 ;;
+  *) sed -n '2,7p' "$0"; exit 1 ;;
 esac

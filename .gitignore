@@ -11,5 +11,3 @@ __pycache__/
 backend/target/
 .claude/
 
-apps/opendots/data/
-apps/opendots/.env
