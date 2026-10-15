@@ -359,3 +359,18 @@ export type CatalogPlan = {
   options: { quant: string; size: number; files: { path: string; size: number; sha256?: string | null }[]; fit: Fit; recommended: boolean; note: string }[]
 }
 export type UninstallResult = { stopped: string[]; profiles_removed: number; freed_bytes: number }
+
+// ---- strata (default engine) ----
+/** GET /api/strata/status (polled every 2s). */
+export type StrataInstance = { id: string; name: string; config: string; port: number; ready: boolean }
+export type StrataStatus = {
+  running: boolean
+  instance: StrataInstance | null
+  loaded: boolean | null
+  auto_load: boolean | null
+  idle_for_s: number | null
+  idle_limit_s: number | null
+  configs: string[]
+  last_error: string | null
+  watchdog: { enabled: boolean; failures: number }
+}

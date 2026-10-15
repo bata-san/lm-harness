@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from "react"
-import { BoxesIcon, DownloadIcon, GaugeIcon, GlobeIcon, KeyRoundIcon, Loader2Icon, LockKeyholeIcon, LogOutIcon, MessageSquareIcon, MoonIcon, ServerIcon, SettingsIcon, ShieldCheckIcon, ShieldIcon, SlidersHorizontalIcon, SunIcon, UserIcon, WrenchIcon } from "lucide-react"
+import { BoxesIcon, DownloadIcon, GaugeIcon, GlobeIcon, KeyRoundIcon, Loader2Icon, LayersIcon, LockKeyholeIcon, LogOutIcon, MessageSquareIcon, MoonIcon, ServerIcon, SettingsIcon, ShieldCheckIcon, ShieldIcon, SlidersHorizontalIcon, SunIcon, UserIcon, WrenchIcon } from "lucide-react"
 
 import { MODE_ICON, ModeSwitch } from "@/components/mode-switch"
 import { Button } from "@/components/ui/button"
@@ -37,11 +37,13 @@ import { RuntimesPage } from "@/pages/runtimes"
 import { ServersPage } from "@/pages/servers"
 import { SecurityPage } from "@/pages/security"
 import { SettingsPage } from "@/pages/settings"
+import { StrataPage } from "@/pages/strata"
 
 // The chat page pulls in markdown rendering and the vault code; load it on demand.
 const ChatPage = lazy(() => import("@/pages/chat").then((m) => ({ default: m.ChatPage })))
 
 const PAGES = {
+  strata: { title: "Strata", icon: LayersIcon, el: StrataPage },
   chat: { title: "チャット", icon: MessageSquareIcon, el: ChatPage },
   dashboard: { title: "ダッシュボード", icon: GaugeIcon, el: DashboardPage },
   downloads: { title: "ダウンロード", icon: DownloadIcon, el: DownloadsPage },
@@ -59,7 +61,7 @@ type PageId = keyof typeof PAGES
 function useHashRoute(): [PageId, (p: PageId, anchor?: string) => void] {
   const read = () => {
     const h = location.hash.slice(1)
-    return (h in PAGES ? h : "chat") as PageId
+    return (h in PAGES ? h : "strata") as PageId
   }
   const [page, setPage] = useState<PageId>(read)
   useEffect(() => {

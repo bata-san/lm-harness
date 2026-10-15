@@ -40,6 +40,9 @@ export function RuntimesPage() {
 
   return (
     <div className="grid gap-4">
+      <p className="text-sm text-muted-foreground">
+        Strata がメインエンジン (既定) です。llama.cpp / vLLM / Ollama は補助ランタイムとして残しています。
+      </p>
       <div className="grid gap-4 md:grid-cols-3">
         {(runtimes ?? []).map((rt) => {
           const job = jobById[rt.install_job]

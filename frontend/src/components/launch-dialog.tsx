@@ -16,10 +16,10 @@ import { bytes, joinArgs, pct, splitArgs } from "@/lib/format"
 import { MODE_LABEL, useMode } from "@/lib/mode"
 
 const RUNTIMES = [
-  { id: "strata", label: "Strata (既定・大型 MoE 専用エンジン)" },
-  { id: "llama.cpp", label: "llama.cpp (llama-server)" },
-  { id: "vllm", label: "vLLM" },
-  { id: "ollama", label: "Ollama (serve)" },
+  { id: "strata", label: "Strata (メインエンジン・既定)" },
+  { id: "llama.cpp", label: "llama.cpp (補助)" },
+  { id: "vllm", label: "vLLM (補助)" },
+  { id: "ollama", label: "Ollama (補助)" },
 ]
 
 export function LaunchDialog({
@@ -153,7 +153,7 @@ export function LaunchDialog({
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>サーバを起動</DialogTitle>
-          <DialogDescription>OpenAI 互換 API (/v1) として公開されます。自動チューニングは検出した GPU/CPU から引数を計算します。</DialogDescription>
+          <DialogDescription>OpenAI 互換 API (/v1) として公開されます。通常は Strata をお使いください。llama.cpp / vLLM / Ollama は補助ランタイムです。</DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4">
