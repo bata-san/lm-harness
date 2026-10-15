@@ -16,9 +16,9 @@ import { bytes, joinArgs, pct, splitArgs } from "@/lib/format"
 import { MODE_LABEL, useMode } from "@/lib/mode"
 
 const RUNTIMES = [
+  { id: "strata", label: "Strata (既定・大型 MoE 専用エンジン)" },
   { id: "llama.cpp", label: "llama.cpp (llama-server)" },
   { id: "vllm", label: "vLLM" },
-  { id: "strata", label: "Strata (大型 MoE 専用エンジン)" },
   { id: "ollama", label: "Ollama (serve)" },
 ]
 
@@ -34,7 +34,7 @@ export function LaunchDialog({
   onLaunched?: () => void
 }) {
   const { data: models } = usePoll<LocalModel[]>(open ? "/models" : null, 0)
-  const [runtime, setRuntime] = useState("llama.cpp")
+  const [runtime, setRuntime] = useState("strata")
   const [model, setModel] = useState("")
   const [name, setName] = useState("")
   const [port, setPort] = useState("")
@@ -51,7 +51,7 @@ export function LaunchDialog({
 
   useEffect(() => {
     if (!open) return
-    setRuntime(initial?.runtime ?? "llama.cpp")
+    setRuntime(initial?.runtime ?? "strata")
     setModel(initial?.model ?? "")
     setName(initial?.name ?? "")
     setPort(initial?.port ? String(initial.port) : "")

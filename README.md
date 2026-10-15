@@ -55,7 +55,9 @@ Windows + **WSL2** 上で NVIDIA GPU と多コア CPU を使い切ることを�
 - **vLLM**: 既定で `--gpu-memory-utilization 0.92 --max-model-len 32768 --enable-prefix-caching`。
 - **Ollama**: `OLLAMA_FLASH_ATTENTION=1`、`OLLAMA_KV_CACHE_TYPE=q8_0`、`OLLAMA_HOST=127.0.0.1:11434` を systemd に設定済み。
 
-## Strata (大型 MoE 専用エンジン)
+## Strata (既定ランタイム)
+
+**Strata が既定のランタイム**です (起動ダイアログの初期選択、API で `runtime` 省略時とも Strata)。GGUF は「モデル」画面の起動ボタンから llama.cpp で起動します。
 
 [Strata](https://github.com/Niko1221/Strata) (MIT) は llama.cpp/ggml の一部を使う、Qwen3.8-Flash-Next 向けの推論エンジンです (頻出 expert を VRAM、残りを RAM に置く)。
 「ランタイム」画面の **Strata** から取得 (`git clone` + venv) し、表示された手順どおり `cd ~/.llm-harness/strata && ./setup.sh` を一度だけ実行してモデル (~70 GB) を導入してください。

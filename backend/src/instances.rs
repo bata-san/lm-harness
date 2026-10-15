@@ -27,7 +27,7 @@ const OLLAMA_DEFAULT_PORT: u16 = 11435;
 
 // ---------------------------------------------------------------------- specs
 fn default_runtime() -> String {
-    "llama.cpp".into()
+    "strata".into()
 }
 
 fn default_true() -> bool {
@@ -572,7 +572,7 @@ mod tests {
         let q: Profile = serde_json::from_value(v).unwrap();
         assert_eq!(q.id, p.id);
         let r: Profile = serde_json::from_value(json!({"id": null, "name": "b", "auto_tune": false, "port": 9000})).unwrap();
-        assert_eq!(r.spec.runtime, "llama.cpp");
+        assert_eq!(r.spec.runtime, "strata");
         assert!(!r.spec.auto_tune);
         assert_eq!(r.spec.port, Some(9000));
         assert_eq!(r.id.len(), 8);
