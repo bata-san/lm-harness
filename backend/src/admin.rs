@@ -163,7 +163,8 @@ fn known_secrets(s: &Settings) -> Vec<String> {
     v
 }
 
-fn audit(st: &AppState, who: &Admin, action: &str, summary: &str) {
+/// Append one audit record for a mutating call (`summary` names keys or ids, never secret values).
+pub(crate) fn audit(st: &AppState, who: &Admin, action: &str, summary: &str) {
     AUDIT.append(&who.ip, &who.user, action, summary, &known_secrets(&st.settings.get()));
 }
 
@@ -497,6 +498,11 @@ const SCHEMA: &[KeyMeta] = &[
     KeyMeta { key: "llama_cpp_dir", ty: "path", desc: "llama.cpp のビルド先ディレクトリ", restart: false },
     KeyMeta { key: "vllm_venv", ty: "path", desc: "vLLM 専用 Python 仮想環境のディレクトリ", restart: false },
     KeyMeta { key: "strata_dir", ty: "path", desc: "Strata のチェックアウト先ディレクトリ", restart: false },
+    KeyMeta { key: "strata_lazy_load", ty: "bool", desc: "Strata を --lazy で起動 (起動直後は VRAM を使わず、初回リクエストで読み込み)。新規起動から有効", restart: false },
+    KeyMeta { key: "strata_idle_unload_s", ty: "integer(0-86400)", desc: "フルモードで Strata が無操作のまま指定秒数を超えたらモデルをアンロード。0 で無効。処理中は解除されません", restart: false },
+    KeyMeta { key: "strata_shared_idle_unload_s", ty: "integer(0-86400)", desc: "共有モード時の無操作アンロード秒数 (短め推奨)。0 で無効。モード切替直後から適用されます", restart: false },
+    KeyMeta { key: "strata_watchdog", ty: "bool", desc: "ハーネスが起動した Strata が予期せず終了したら自動再起動 (指数バックオフ、10 分で 5 回失敗すると停止)。手動停止では再起動しません", restart: false },
+    KeyMeta { key: "strata_swap_on_demand", ty: "bool", desc: "起動していない Strata の設定名がリクエストで指定されたら、起動中の Strata を停止して切り替え (処理中なら最大 60 秒待機)", restart: false },
     KeyMeta { key: "ollama_url", ty: "url", desc: "Ollama API の URL", restart: false },
     KeyMeta { key: "max_concurrent_downloads", ty: "integer(1-16)", desc: "フルモードでの同時ダウンロード数 (反映にはモード再適用か再起動が必要)", restart: true },
     KeyMeta { key: "connections_per_file", ty: "integer(1-64)", desc: "フルモードでの 1 ファイルあたりの並列接続数 (反映にはモード再適用か再起動が必要)", restart: true },
@@ -1340,6 +1346,10 @@ mod tests {
         let keys: Vec<&str> = SCHEMA.iter().map(|m| m.key).collect();
         for k in settings_value(&s).as_object().unwrap().keys() {
             assert!(keys.contains(&k.as_str()), "schema covers {k}");
+        }
+        for k in ["strata_lazy_load", "strata_idle_unload_s", "strata_shared_idle_unload_s", "strata_watchdog", "strata_swap_on_demand"] {
+            let meta = SCHEMA.iter().find(|m| m.key == k).unwrap_or_else(|| panic!("schema entry for {k}"));
+            assert!(!meta.restart, "{k} applies to new launches / live, no restart");
         }
     }
 

@@ -17,6 +17,7 @@ mod procs;
 mod proxy;
 mod runtimes;
 mod state;
+mod strata;
 mod system;
 mod topology;
 mod tunnel;
@@ -140,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         power: power::PowerManager::new(settings.clone(), mode_tx),
         auth: auth::AuthManager::load(),
         tunnel: tunnel::TunnelManager::load(cli.port),
+        strata: Arc::new(strata::Supervisor::default()),
         settings,
         mode_rx,
     };
@@ -148,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(state.instances.clone().monitor(state.clone()));
     tokio::spawn(state.power.clone().run(state.clone()));
     tokio::spawn(state.tunnel.clone().run(state.clone()));
+    tokio::spawn(strata::run(state.clone()));
     tokio::spawn(catalog::run(state.clone()));
     state.instances.autostart(&state).await;
 
@@ -165,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(anthropic::router())
         .merge(vault::router())
         .merge(admin::router())
+        .merge(strata::router())
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_auth));
 
     let app = Router::new()
@@ -186,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("shutting down: stopping servers");
     state.tunnel.stop().await;
+    state.strata.request_stop();
     state.instances.stop_all().await;
     state.downloads.persist();
     if admin::restart_requested() {

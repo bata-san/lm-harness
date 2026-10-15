@@ -14,12 +14,13 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::instances::Instance;
 use crate::state::AppState;
+use crate::strata::{self, ActivityGuard};
 
 /// Largest JSON request body that is buffered to read the `model` field.
 const MAX_JSON_BODY: usize = 64 * 1024 * 1024;
@@ -37,7 +38,11 @@ static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
 });
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/v1/models", get(list_models)).route("/v1/{*rest}", any(forward))
+    Router::new()
+        .route("/v1/models", get(list_models))
+        // Strata only: the other runtimes have no Responses API.
+        .route("/v1/responses", post(responses))
+        .route("/v1/{*rest}", any(forward))
 }
 
 // ------------------------------------------------------------------ errors
@@ -55,6 +60,8 @@ fn no_instance() -> Response {
 /// A running server a request can be routed to.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Target {
+    /// Instance id (used to find its activity counter).
+    pub id: String,
     /// Model id under models_dir (empty for ollama).
     pub model: String,
     pub name: String,
@@ -68,7 +75,7 @@ pub struct Target {
 }
 
 /// Address to connect to: wildcard bind addresses mean loopback.
-fn upstream_base(host: &str, port: u16) -> String {
+pub(crate) fn upstream_base(host: &str, port: u16) -> String {
     let h = host.trim();
     let h = if h.is_empty() || h == "0.0.0.0" || h == "::" || h == "[::]" { "127.0.0.1" } else { h };
     if h.contains(':') && !h.starts_with('[') {
@@ -81,6 +88,7 @@ fn upstream_base(host: &str, port: u16) -> String {
 fn target_of(inst: &Instance, models_dir: &std::path::Path) -> Target {
     let served = if inst.runtime == "vllm" && !inst.model.is_empty() { models_dir.join(&inst.model).to_string_lossy().into_owned() } else { inst.model.clone() };
     Target {
+        id: inst.id().to_string(),
         model: inst.model.clone(),
         name: inst.proc.name.clone(),
         runtime: inst.runtime.clone(),
@@ -267,6 +275,11 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
         (None, has_body.then_some(body))
     };
     let requested = buffered.as_deref().and_then(model_field);
+    if let Some(model) = requested.as_deref() {
+        if let Err(e) = state.strata.ensure_for_request(&state, model).await {
+            return oai_error(StatusCode::SERVICE_UNAVAILABLE, e.message(), "server_error", "strata_unavailable");
+        }
+    }
 
     let all = targets(&state);
     let Some(idx) = select_target(&all, requested.as_deref()) else {
@@ -275,33 +288,70 @@ async fn forward(State(state): State<AppState>, req: Request) -> Response {
     let target = &all[idx];
 
     let path_q = parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or(parts.uri.path());
-    let url = format!("{}{}", target.base, path_q);
-    let mut rb = CLIENT.request(parts.method.clone(), &url).headers(forward_headers(&parts.headers, !buffer));
-    rb = match (buffered, stream_body) {
+    let headers = forward_headers(&parts.headers, !buffer);
+    let body: Option<reqwest::Body> = match (buffered, stream_body) {
         (Some(b), _) => {
             let b = if target.runtime == "vllm" { rewrite_model(&b, &target.served).unwrap_or(b) } else { b };
-            rb.body(b)
+            Some(reqwest::Body::from(b))
         }
-        (None, Some(body)) => rb.body(reqwest::Body::wrap_stream(body.into_data_stream())),
-        (None, None) => rb,
+        (None, Some(body)) => Some(reqwest::Body::wrap_stream(body.into_data_stream())),
+        (None, None) => None,
     };
+    let guard = strata::begin_activity(&state, target);
+    match relay(target, parts.method.clone(), path_q, headers, body, guard).await {
+        Ok(resp) => resp,
+        Err((status, code, msg)) => oai_error(status, msg, "server_error", code),
+    }
+}
 
-    let upstream = match rb.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            let (status, code, msg) = send_error_parts(&e, target);
-            return oai_error(status, msg, "server_error", code);
-        }
-    };
-
+/// Send one request to `target` and return its response unread, so the caller can stream it.
+/// `guard` lives as long as the response body: an in-flight stream keeps the server non-idle, and
+/// dropping the response (client disconnect) closes the upstream connection, which aborts the
+/// generation. Errors are `(status, machine code, message)`.
+pub(crate) async fn relay(
+    target: &Target,
+    method: Method,
+    path_q: &str,
+    headers: HeaderMap,
+    body: Option<reqwest::Body>,
+    guard: Option<ActivityGuard>,
+) -> Result<Response, (StatusCode, &'static str, String)> {
+    let mut rb = CLIENT.request(method, format!("{}{}", target.base, path_q)).headers(headers);
+    if let Some(b) = body {
+        rb = rb.body(b);
+    }
+    let upstream = rb.send().await.map_err(|e| send_error_parts(&e, target))?;
     let status = upstream.status();
     let headers = response_headers(upstream.headers());
-    // No buffering: chunks are handed to the client as they arrive. Dropping the response (client
-    // disconnect) closes the upstream connection, which aborts the generation.
-    let mut resp = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let mut resp = Response::new(Body::from_stream(strata::guard_stream(upstream.bytes_stream(), guard)));
     *resp.status_mut() = status;
     *resp.headers_mut() = headers;
-    resp
+    Ok(resp)
+}
+
+/// `POST /v1/responses` (OpenAI Responses API). Strata is stateless here; other runtimes 404.
+async fn responses(State(state): State<AppState>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, MAX_JSON_BODY).await {
+        Ok(b) => b,
+        Err(_) => return oai_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large or unreadable", "invalid_request_error", "body_too_large"),
+    };
+    let requested = model_field(&body);
+    if let Some(model) = requested.as_deref() {
+        if let Err(e) = state.strata.ensure_for_request(&state, model).await {
+            return oai_error(StatusCode::SERVICE_UNAVAILABLE, e.message(), "server_error", "strata_unavailable");
+        }
+    }
+    let Some(target) = pick_target(&state, requested.as_deref()) else {
+        return no_instance();
+    };
+    if target.runtime != "strata" {
+        return oai_error(StatusCode::NOT_FOUND, "/v1/responses は Strata 実行時のみ利用できます", "invalid_request_error", "unsupported_runtime");
+    }
+    match strata::passthrough(&state, &target, "/v1/responses", &parts.headers, body).await {
+        Ok(resp) => resp,
+        Err((status, code, msg)) => oai_error(status, msg, "server_error", code),
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +360,7 @@ mod tests {
     use axum::http::{HeaderName, HeaderValue};
 
     fn t(model: &str, name: &str, runtime: &str, ready: bool) -> Target {
-        Target { model: model.into(), name: name.into(), runtime: runtime.into(), ready, base: "http://127.0.0.1:8080".into(), served: model.into(), started_at: 0.0 }
+        Target { id: format!("id-{name}"), model: model.into(), name: name.into(), runtime: runtime.into(), ready, base: "http://127.0.0.1:8080".into(), served: model.into(), started_at: 0.0 }
     }
 
     #[test]

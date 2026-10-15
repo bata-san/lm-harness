@@ -16,7 +16,7 @@ use std::convert::Infallible;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use crate::privacy;
 use crate::proxy::{self, Target};
 use crate::state::AppState;
+use crate::strata;
 
 /// Images arrive base64 inside the JSON body.
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -610,7 +611,13 @@ fn parse_body(body: &[u8]) -> Result<Value, Box<Response>> {
     serde_json::from_slice::<Value>(body).map_err(|e| Box::new(anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("Request body is not valid JSON: {e}"))))
 }
 
-async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
+/// Error for a failed relay to a Strata server, in the Anthropic error shape.
+fn relay_error(status: StatusCode, msg: String) -> Response {
+    let kind = if status == StatusCode::SERVICE_UNAVAILABLE { "overloaded_error" } else { "api_error" };
+    anth_error(status, kind, msg)
+}
+
+async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return *r,
@@ -619,9 +626,19 @@ async fn messages(State(state): State<AppState>, body: Bytes) -> Response {
     if requested.trim().is_empty() {
         return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "model: Field required");
     }
+    if let Err(e) = state.strata.ensure_for_request(&state, &requested).await {
+        return anth_error(StatusCode::SERVICE_UNAVAILABLE, "overloaded_error", e.message());
+    }
     let Some(target) = proxy::pick_target(&state, Some(&requested)) else {
         return no_instance();
     };
+    if target.runtime == "strata" {
+        // Strata speaks the Anthropic Messages API itself: relay it without translation.
+        return match strata::passthrough(&state, &target, "/v1/messages", &headers, body).await {
+            Ok(resp) => resp,
+            Err((status, _, msg)) => relay_error(status, msg),
+        };
+    }
     run_messages(&target, &req, &requested).await
 }
 
@@ -651,13 +668,21 @@ pub(crate) async fn run_messages(target: &Target, req: &Value, requested: &str) 
     }
 }
 
-async fn count_tokens(body: Bytes) -> Response {
+async fn count_tokens(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let req = match parse_body(&body) {
         Ok(v) => v,
         Err(r) => return *r,
     };
     if !req.get("messages").is_some_and(Value::is_array) {
         return anth_error(StatusCode::BAD_REQUEST, "invalid_request_error", "messages: Field required");
+    }
+    // A running Strata counts with its own tokenizer; other runtimes use the estimate below.
+    let requested = req.get("model").and_then(Value::as_str).map(str::to_owned);
+    if let Some(target) = proxy::pick_target(&state, requested.as_deref()).filter(|t| t.runtime == "strata") {
+        return match strata::passthrough(&state, &target, "/v1/messages/count_tokens", &headers, body).await {
+            Ok(resp) => resp,
+            Err((status, _, msg)) => relay_error(status, msg),
+        };
     }
     Json(json!({ "input_tokens": estimate_tokens(&req) })).into_response()
 }
@@ -869,7 +894,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        Target { model: "org/m/m.gguf".into(), name: "m".into(), runtime: "llama.cpp".into(), ready: true, base: format!("http://{addr}"), served: "org/m/m.gguf".into(), started_at: 0.0 }
+        Target { id: "fake".into(), model: "org/m/m.gguf".into(), name: "m".into(), runtime: "llama.cpp".into(), ready: true, base: format!("http://{addr}"), served: "org/m/m.gguf".into(), started_at: 0.0 }
     }
 
     fn parse_sse(text: &str) -> Vec<(String, Value)> {
@@ -939,7 +964,7 @@ mod tests {
 
     #[test]
     fn models_shape() {
-        let t = Target { model: "org/m/Qwen.gguf".into(), name: "q".into(), runtime: "llama.cpp".into(), ready: true, base: String::new(), served: String::new(), started_at: 86400.0 };
+        let t = Target { id: "q".into(), model: "org/m/Qwen.gguf".into(), name: "q".into(), runtime: "llama.cpp".into(), ready: true, base: String::new(), served: String::new(), started_at: 86400.0 };
         let resp = models_response(&[t.clone(), t]);
         assert_eq!(resp.status(), 200);
     }

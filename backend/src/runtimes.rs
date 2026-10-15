@@ -378,11 +378,13 @@ pub struct JobDef {
     pub sudo: bool,
 }
 
-pub const JOBS: [JobDef; 6] = [
+pub const JOBS: [JobDef; 8] = [
     JobDef { id: "setup", title: "WSL 基本セットアップ (apt / CUDA Toolkit / uv)", script: "wsl/setup.sh", sudo: true },
     JobDef { id: "build-llama-cpp", title: "llama.cpp を CUDA でビルド / 更新", script: "wsl/build-llama-cpp.sh", sudo: false },
     JobDef { id: "install-vllm", title: "vLLM を専用 venv にインストール / 更新", script: "wsl/install-vllm.sh", sudo: false },
     JobDef { id: "install-strata", title: "Strata を取得 / 更新 (git clone + venv)", script: "wsl/install-strata.sh", sudo: false },
+    JobDef { id: "update-strata", title: "Strata を更新 (./update.sh のみ・モデルは取得しない)", script: "wsl/update-strata.sh", sudo: false },
+    JobDef { id: "bench-strata", title: "Strata をベンチマーク (./bench.sh・5〜10 分・GPU を使用)", script: "wsl/bench-strata.sh", sudo: false },
     JobDef { id: "install-ollama", title: "Ollama をインストール / 更新", script: "wsl/install-ollama.sh", sudo: true },
     JobDef { id: "update-harness", title: "ハーネス本体を更新 (git pull --ff-only → ./harness.sh install)", script: "wsl/update-harness.sh", sudo: false },
 ];
@@ -476,7 +478,14 @@ unrelated_metric 99
 
     #[test]
     fn jobs_table() {
+        assert_eq!(JOBS.len(), 8);
         assert_eq!(JOBS.iter().filter(|j| j.sudo).map(|j| j.id).collect::<Vec<_>>(), vec!["setup", "install-ollama"]);
+        // Strata maintenance runs without sudo and as its own scripts
+        for id in ["update-strata", "bench-strata"] {
+            let j = job(id).unwrap_or_else(|| panic!("job {id}"));
+            assert!(!j.sudo && j.script.starts_with("wsl/") && j.script.ends_with(".sh"), "{id}");
+            assert!(scripts_dir().join(j.script).is_file(), "script for {id} exists");
+        }
         let (cmd, env) = job_command("build-llama-cpp", &Settings::default()).unwrap();
         assert_eq!(cmd[0], "bash");
         assert!(cmd[1].ends_with("scripts/wsl/build-llama-cpp.sh"));

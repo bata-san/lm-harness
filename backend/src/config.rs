@@ -60,6 +60,16 @@ pub struct Settings {
     /// Enables the child-log line filter and the runtime flags that disable request logging.
     #[serde(default = "default_privacy_mode")]
     pub privacy_mode: bool,
+    /// Start Strata with `--lazy`: the API comes up without loading the engine (no VRAM until first use).
+    pub strata_lazy_load: bool,
+    /// Full mode: unload an idle Strata model after this many seconds (0 = never).
+    pub strata_idle_unload_s: u64,
+    /// Shared mode: same as `strata_idle_unload_s`, with a shorter default (0 = never).
+    pub strata_shared_idle_unload_s: u64,
+    /// Relaunch a harness-started Strata that dies unexpectedly (never after a manual stop).
+    pub strata_watchdog: bool,
+    /// Start the Strata config that a request names when another Strata is running.
+    pub strata_swap_on_demand: bool,
     pub mode: ModeSettings,
 }
 
@@ -84,6 +94,11 @@ impl Default for Settings {
             port_range_start: 8080,
             extra_env: Default::default(),
             privacy_mode: true,
+            strata_lazy_load: true,
+            strata_idle_unload_s: 600,
+            strata_shared_idle_unload_s: 60,
+            strata_watchdog: true,
+            strata_swap_on_demand: true,
             mode: ModeSettings::default(),
         }
     }
@@ -193,6 +208,16 @@ pub fn write_json<T: Serialize + ?Sized>(name: &str, value: &T) -> anyhow::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strata_settings_defaults_for_old_files() {
+        let old: Settings = serde_json::from_str(r#"{"models_dir": "/m"}"#).unwrap();
+        assert!(old.strata_lazy_load && old.strata_watchdog && old.strata_swap_on_demand);
+        assert_eq!((old.strata_idle_unload_s, old.strata_shared_idle_unload_s), (600, 60));
+        let off: Settings = serde_json::from_str(r#"{"strata_lazy_load": false, "strata_idle_unload_s": 0}"#).unwrap();
+        assert!(!off.strata_lazy_load);
+        assert_eq!(off.strata_idle_unload_s, 0);
+    }
 
     #[test]
     fn privacy_mode_defaults_to_true_for_old_files() {

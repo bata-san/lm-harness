@@ -20,6 +20,7 @@ use crate::error::{ok, ApiError, ApiResult};
 use crate::mode::{Mode, ModeProfile};
 use crate::procs::{LogTail, Proc, Status};
 use crate::state::AppState;
+use crate::strata::{self, Activity};
 use crate::{affinity, models, runtimes, tuning};
 
 const MONITOR_INTERVAL: Duration = Duration::from_millis(1500);
@@ -108,6 +109,8 @@ pub struct Instance {
     pub port: u16,
     /// Mode the server was launched (and tuned) under.
     pub mode: Mode,
+    /// In-flight request counter; drives Strata's idle unload (see `strata.rs`).
+    pub activity: Arc<Activity>,
     live: Mutex<Live>,
 }
 
@@ -189,6 +192,11 @@ impl InstanceManager {
         self.instances.lock().iter().filter(|i| i.alive()).cloned().collect()
     }
 
+    /// Every instance this run has launched, including the ones that have exited.
+    pub fn all(&self) -> Vec<Arc<Instance>> {
+        self.instances.lock().clone()
+    }
+
     pub fn list(&self, current: Mode) -> Vec<Value> {
         let mut all: Vec<Arc<Instance>> = self.instances.lock().clone();
         all.sort_by(|a, b| b.proc.started_at.total_cmp(&a.proc.started_at));
@@ -229,6 +237,17 @@ impl InstanceManager {
     }
 
     async fn effective_args(&self, state: &AppState, spec: &LaunchSpec, profile: &ModeProfile) -> Vec<String> {
+        if spec.runtime == "strata" {
+            // Strata sizes its VRAM/RAM/SSD expert tiers itself (setup picks the low-RAM mode and the
+            // expert cache is `auto`), so FULL adds no tuning. SHARED only hands back what the desktop
+            // needs. `--lazy` (launch default) is added unless the user chose either spelling.
+            let shared: Vec<String> = if spec.auto_tune && profile.mode == Mode::Shared {
+                vec!["--vram-reserve-mib".into(), profile.vram_reserve_mb.to_string(), "--pool-workers".into(), profile.physical_cores.max(1).to_string()]
+            } else {
+                vec![]
+            };
+            return strata::launch_args(self.settings.get().strata_lazy_load, &shared, &spec.args);
+        }
         if !spec.auto_tune {
             return spec.args.clone();
         }
@@ -246,14 +265,6 @@ impl InstanceManager {
                 let telemetry = state.telemetry.clone();
                 let gpus = tokio::task::spawn_blocking(move || telemetry.gpus()).await.unwrap_or_default();
                 tuning::vllm_args(profile, &gpus)
-            }
-            // Strata sizes its VRAM/RAM/SSD expert tiers itself (setup picks the low-RAM mode and the
-            // expert cache is `auto`), so FULL adds nothing. SHARED only hands back what the desktop needs.
-            "strata" => {
-                if profile.mode != Mode::Shared {
-                    return spec.args.clone();
-                }
-                vec!["--vram-reserve-mib".into(), profile.vram_reserve_mb.to_string(), "--pool-workers".into(), profile.physical_cores.max(1).to_string()]
             }
             _ => return spec.args.clone(),
         };
@@ -306,6 +317,7 @@ impl InstanceManager {
             port,
             mode: profile.mode,
             spec,
+            activity: Activity::new(),
             live: Mutex::new(Live::default()),
         });
         self.instances.lock().push(inst.clone());
